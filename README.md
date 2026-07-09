@@ -334,7 +334,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 
 For benchmarking, performance numbers, and implementation details, see the [SGLang Omni cookbook](https://github.com/sgl-project/sglang-omni/blob/main/docs/cookbook/moss_transcribe_diarize.md). The following single-H100 results are reported for short- and long-sequence multi-speaker ASR tasks.
 
-`movies800times` short-sequence ASR:
+`movies` short-sequence ASR:
 
 | Concurrency | Throughput (req/s) | Mean latency (s) | RTF mean | audio_s/s |
 |---:|---:|---:|---:|---:|
