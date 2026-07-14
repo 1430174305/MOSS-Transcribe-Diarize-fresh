@@ -177,6 +177,8 @@ source .venv/bin/activate
 uv pip install -e ".[torch-runtime]" --torch-backend=auto
 ```
 
+微调说明请参阅 [FINETUNING.md](FINETUNING.md)。
+
 ### Python 用法
 
 ```python

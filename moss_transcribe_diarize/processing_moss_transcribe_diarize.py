@@ -195,7 +195,8 @@ class MossTranscribeDiarizeProcessor(ProcessorMixin):
             output.extend([self.audio_token_id] * remainder)
         return output
 
-    def _expand_audio_token(self, text: str, num_audio_tokens: int, max_length: int) -> list[int]:
+    def expand_audio_token(self, text: str, num_audio_tokens: int, max_length: int) -> list[int]:
+        """Replace the audio placeholder with audio and time-marker token IDs."""
         audio_ids = self._audio_span_ids(num_audio_tokens)
         audio_token_count = text.count(self.audio_token)
         if audio_token_count != 1:
@@ -244,7 +245,7 @@ class MossTranscribeDiarizeProcessor(ProcessorMixin):
         audio_token_counts.scatter_add_(0, audio_chunk_mapping, audio_feature_lengths)
 
         encoded = [
-            self._expand_audio_token(prompt, int(num_audio_tokens.item()), max_length)
+            self.expand_audio_token(prompt, int(num_audio_tokens.item()), max_length)
             for prompt, num_audio_tokens in zip(texts, audio_token_counts)
         ]
         max_seq_len = max(len(ids) for ids in encoded)
