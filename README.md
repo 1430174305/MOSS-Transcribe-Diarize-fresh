@@ -18,6 +18,7 @@ MOSS-Transcribe-Diarize 0.9B is an open-source SOTA end-to-end audio understandi
 
 ## News
 
+* 2026-07-14: 🏆 MOSS-Transcribe-Diarize won first place in the 2nd MLC-SLM Challenge at INTERSPEECH 2026, covering 14 languages.
 * 2026-07-09: Open-sourced MOSS-Transcribe-Diarize 0.9B.
 
 ## Contents
@@ -29,9 +30,9 @@ MOSS-Transcribe-Diarize 0.9B is an open-source SOTA end-to-end audio understandi
 - [Quickstart](#quickstart)
   - [Environment Setup](#environment-setup)
   - [Python Usage](#python-usage)
-  - [Custom Prompt and Hotwords](#custom-prompt-and-hotwords)
-  - [Serve with vLLM](#serve-with-vllm)
   - [Serve with SGLang Omni](#serve-with-sglang-omni)
+  - [Serve with vLLM](#serve-with-vllm)
+  - [Custom Prompt and Hotwords](#custom-prompt-and-hotwords)
   - [Subtitle Web App](#subtitle-web-app)
 - [Citation](#citation)
 - [Star History](#star-history)
@@ -41,6 +42,8 @@ MOSS-Transcribe-Diarize 0.9B is an open-source SOTA end-to-end audio understandi
 MOSS-Transcribe-Diarize is our flagship SOTA model family for turning real-world long-form audio into structured, speaker-aware transcripts in one pass. Instead of stitching together separate ASR and diarization systems, these models jointly perform speech transcription and speaker diarization, producing time-aligned text with precise timestamps and consistent speaker labels such as `[S01]`, `[S02]`, and beyond.
 
 Built for meetings, calls, podcasts, interviews, lectures, and video content, MOSS-Transcribe-Diarize is designed to handle long, messy, multi-speaker recordings where reliability matters. It can also emit optional acoustic event annotations, giving downstream systems a richer understanding of what happened, who spoke, and when.
+
+MOSS-Transcribe-Diarize supports 50+ languages.
 
 The model accepts raw audio and emits a compact timestamped transcript. The canonical output format is:
 
@@ -217,55 +220,13 @@ The message flow follows the common Qwen multimodal pattern. The chat template i
 3. `processor(text=text, audio=audios)` computes Whisper input features and expands audio placeholders.
 4. `model.generate(...)` produces timestamped transcription and diarization text.
 
-### Custom Prompt and Hotwords
-
-The default prompt is optimized for timestamped transcription and speaker diarization:
-
-```text
-请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。
-```
-
-To add hotwords, append a short hint to the default prompt:
-
-```text
-请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。热词提示：热词1, 热词2, 热词3
-```
-
-More prompt recipes are available in [examples/prompts.md](examples/prompts.md). The same prompt can be passed to `build_transcription_messages`, `mtd-subtitle`, and `mtd-subtitle-web`.
-
-### Serve with vLLM
-
-MOSS-Transcribe-Diarize supports vLLM serving through the OpenAI-compatible transcription API. Use a pinned vLLM nightly build that includes the MOSS-Transcribe-Diarize model registration. Choose one of the following commands: for CUDA 12 environments, use `cu129`; for CUDA 13 environments, use `cu130`.
-
-```bash
-uv pip install -U vllm \
-  --torch-backend=auto \
-  --extra-index-url https://wheels.vllm.ai/68b4a1d582818e67adc903bf1b8fc5a5447da2fa/cu129
-```
-
-or:
-
-```bash
-uv pip install -U vllm \
-  --torch-backend=auto \
-  --extra-index-url https://wheels.vllm.ai/68b4a1d582818e67adc903bf1b8fc5a5447da2fa/cu130
-```
-
-```bash
-vllm serve OpenMOSS-Team/MOSS-Transcribe-Diarize --trust-remote-code
-```
-
-```bash
-curl http://localhost:8000/v1/audio/transcriptions \
-  -F model="OpenMOSS-Team/MOSS-Transcribe-Diarize" \
-  -F file=@"audio.wav" \
-  -F response_format="json" \
-  -F temperature="0"
-```
-
 ### Serve with SGLang Omni
 
-The recommended way to serve MOSS-Transcribe-Diarize is [SGLang Omni](https://github.com/sgl-project/sglang-omni) through the OpenAI-compatible `/v1/audio/transcriptions` endpoint. Install `sglang-omni` by following the [installation guide](https://github.com/sgl-project/sglang-omni/blob/main/docs/get_started/installation.md), then download the model:
+[SGLang Omni](https://github.com/sgl-project/sglang-omni) is the recommended serving backend for MOSS-Transcribe-Diarize, providing optimized long-form audio inference through the OpenAI-compatible `/v1/audio/transcriptions` endpoint.
+
+SGLang Omni currently targets CUDA 13 environments. Please follow the official [installation guide](https://github.com/sgl-project/sglang-omni/blob/main/docs/get_started/installation.md) for the supported setup. For CUDA 12 environments, the vLLM workflow is also available below.
+
+Download the model:
 
 ```bash
 hf download OpenMOSS-Team/MOSS-Transcribe-Diarize
@@ -353,6 +314,52 @@ For benchmarking, performance numbers, and implementation details, see the [SGLa
 | 4 | 0.036 | 105.6 | 0.0461 | 81.64 |
 | 8 | 0.040 | 172.6 | 0.0754 | 90.62 |
 | 16 | 0.043 | 282.8 | 0.1237 | 98.83 |
+
+### Serve with vLLM
+
+MOSS-Transcribe-Diarize supports vLLM serving through the OpenAI-compatible transcription API. Use a pinned vLLM nightly build that includes the MOSS-Transcribe-Diarize model registration. Choose one of the following commands: for CUDA 12 environments, use `cu129`; for CUDA 13 environments, use `cu130`.
+
+```bash
+uv pip install -U vllm \
+  --torch-backend=auto \
+  --extra-index-url https://wheels.vllm.ai/68b4a1d582818e67adc903bf1b8fc5a5447da2fa/cu129
+```
+
+or:
+
+```bash
+uv pip install -U vllm \
+  --torch-backend=auto \
+  --extra-index-url https://wheels.vllm.ai/68b4a1d582818e67adc903bf1b8fc5a5447da2fa/cu130
+```
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-Transcribe-Diarize --trust-remote-code
+```
+
+```bash
+curl http://localhost:8000/v1/audio/transcriptions \
+  -F model="OpenMOSS-Team/MOSS-Transcribe-Diarize" \
+  -F file=@"audio.wav" \
+  -F response_format="json" \
+  -F temperature="0"
+```
+
+### Custom Prompt and Hotwords
+
+The default prompt is optimized for timestamped transcription and speaker diarization:
+
+```text
+请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。
+```
+
+To add hotwords, append a short hint to the default prompt:
+
+```text
+请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。热词提示：热词1, 热词2, 热词3
+```
+
+More prompt recipes are available in [examples/prompts.md](examples/prompts.md). The same prompt can be passed to `build_transcription_messages`, `mtd-subtitle`, and `mtd-subtitle-web`.
 
 ### Subtitle Web App
 
