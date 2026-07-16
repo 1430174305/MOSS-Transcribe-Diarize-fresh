@@ -41,6 +41,7 @@ MOSS-Transcribe-Diarize 0.9B is an open-source SOTA end-to-end audio understandi
   - [Serve with vLLM](#serve-with-vllm)
   - [Custom Prompt and Hotwords](#custom-prompt-and-hotwords)
   - [Subtitle Web App](#subtitle-web-app)
+- [Fine-tuning](#fine-tuning)
 - [Citation](#citation)
 - [Star History](#star-history)
 
@@ -390,6 +391,35 @@ mtd-subtitle /path/to/input.mp4 \
   --model OpenMOSS-Team/MOSS-Transcribe-Diarize \
   --out-dir runs/example \
   --render
+```
+
+## Fine-tuning
+
+This repo ships an enhanced fine-tuning stack for domain adaptation. It extends the minimal `finetune.py` with selective parameter freezing, LoRA, FlashAttention-2, token-weighted loss (timestamps / speaker tags), meeting-domain audio augmentation, length-bucketed sampling, multi-prompt mixing, and offline generation-based evaluation. See [`FINETUNING.md`](./FINETUNING.md) for the full guide.
+
+- `prepare_data.py` — normalize raw transcripts (speaker renumbering, timestamp validation, train/eval split)
+- `finetune.py` — training entrypoint (single-GPU or `torchrun` multi-GPU)
+- `evaluate.py` — offline scoring (CER / cpCER / Δcp / timestamp MAE / DER)
+- `moss_transcribe_diarize/training/` — dataset, collator, augmentor, weighted Trainer, metrics
+
+Recommended single-stage recipe (freeze encoder + LoRA + VQAdaptor trainable):
+
+```bash
+# 1) prepare data (one record per line: {"audio": "...", "transcript": "..."})
+python prepare_data.py --input_jsonl raw.jsonl --output_dir data --train_split 0.95
+
+# 2) train (multi-GPU DDP)
+torchrun --nproc_per_node=8 finetune.py \
+  --train_jsonl data/train.jsonl --eval_jsonl data/eval.jsonl \
+  --output_dir outputs/finetuned --max_length 32768 \
+  --freeze_whisper_encoder true --use_lora true --lora_r 64 --lora_alpha 128 \
+  --learning_rate 2e-5 --num_train_epochs 4 --bf16 --gradient_checkpointing \
+  --attn_implementation flash_attention_2 \
+  --dataloader_num_workers 8 --dataloader_persistent_workers true --dataloader_pin_memory true
+
+# 3) evaluate against the baseline
+python evaluate.py --model outputs/finetuned --eval_jsonl data/eval.jsonl \
+  --max_new_tokens 65536 --output runs/eval.json
 ```
 
 ## Citation

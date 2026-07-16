@@ -10,6 +10,7 @@ pretrained/
 outputs/
 examples/*
 !examples/*.md
+!examples/*.txt
 runs/
 
 # Large or transient runtime files.

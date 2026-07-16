@@ -35,6 +35,13 @@ torch-runtime = [
   "torchaudio>=2.8",
 ]
 flash-attn = ["flash-attn"]
+train = [
+  "accelerate>=1.0",
+  "peft>=0.14",
+  "scipy>=1.11",
+  "soundfile>=0.12",
+  "soxr>=0.5",
+]
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]

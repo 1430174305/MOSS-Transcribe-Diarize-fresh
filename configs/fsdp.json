@@ -1,0 +1,6 @@
+{
+  "fsdp_transformer_layer_cls_to_wrap": ["Qwen3DecoderLayer", "WhisperEncoderLayer"],
+  "xla": false,
+  "xla_fsdp_v2": false,
+  "xla_fsdp_grad_ckpt": true
+}

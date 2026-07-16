@@ -1,123 +1,100 @@
 #!/usr/bin/env python3
-"""Fine-tune MOSS-Transcribe-Diarize on conversation-format JSONL data."""
+"""Fine-tune MOSS-Transcribe-Diarize with quality-focused optimizations.
+
+This is an enhanced replacement for the minimal `finetune.py` shipped in the
+upstream repo. It adds, on top of the original workflow:
+
+- selective parameter freezing (Whisper encoder) + optional LoRA on the LM
+- FlashAttention-2 and gradient checkpointing for memory-efficient long audio
+- token-weighted causal LM loss (timestamps / speaker tags upweighted)
+- meeting-domain, timing-preserving audio augmentation (RIR / noise / gain)
+- length-bucketed sampling to cut padding waste
+- multi-prompt mixing for stronger instruction following
+- teacher-forced eval during training + offline generation eval via evaluate.py
+
+Multi-GPU: run with `torchrun --nproc_per_node=<N> finetune.py ...` (DDP).
+FSDP is optional for memory-tight long-sequence runs.
+"""
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
-from pathlib import Path
-
-import soundfile as sf
-import soxr
+import numpy as np
 import torch
-from torch.utils.data import Dataset
 from transformers import (
     AutoModelForCausalLM,
     HfArgumentParser,
-    Trainer,
     TrainingArguments,
 )
 
-from moss_transcribe_diarize.inference_utils import build_transcription_messages
 from moss_transcribe_diarize.processing_moss_transcribe_diarize import MossTranscribeDiarizeProcessor
+from moss_transcribe_diarize.training import (
+    ConversationDataset,
+    DataCollator,
+    ScriptArguments,
+    WeightedTrainer,
+    build_prompt_pool,
+)
+from moss_transcribe_diarize.training.metrics import compute_token_accuracy
 
 
-@dataclass
-class ScriptArguments:
-    train_jsonl: str = field(metadata={"help": "Conversation-format training manifest."})
-    model_name_or_path: str = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
-    max_length: int = 131072
-    attn_implementation: str = "sdpa"
+def freeze_module(model, attribute_path: str, freeze: bool) -> None:
+    """Toggle requires_grad on a submodule reached by dotted path."""
+    obj = model
+    for part in attribute_path.split("."):
+        obj = getattr(obj, part)
+    for param in obj.parameters():
+        param.requires_grad_(freeze)
 
 
-class ConversationDataset(Dataset):
-    def __init__(self, path: str):
-        manifest = Path(path).expanduser().resolve()
-        self.samples = []
-        with manifest.open(encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                self.samples.append(self._parse(json.loads(line), manifest.parent, line_no))
-        if not self.samples:
-            raise ValueError(f"No samples found in {manifest}")
+def apply_parameter_strategy(model, args: ScriptArguments) -> list:
+    """Freeze encoder / VQAdaptor according to the selected strategy.
 
-    @staticmethod
-    def _parse(row: dict, root: Path, line_no: int) -> dict[str, str]:
-        conversation = row.get("conversation") or []
-        expected = [("user", "text"), ("user", "audio"), ("assistant", "text")]
-        if not isinstance(conversation, list) or not all(isinstance(item, dict) for item in conversation):
-            raise ValueError(f"Line {line_no}: conversation must be a list of messages")
-        actual = [(item.get("role"), item.get("message_type")) for item in conversation]
-        if actual != expected:
-            raise ValueError(f"Line {line_no}: expected user/text, user/audio, assistant/text")
-
-        prompt, audio_path, target = (item.get("content") for item in conversation)
-        if not all(isinstance(value, str) and value.strip() for value in (prompt, audio_path, target)):
-            raise ValueError(f"Line {line_no}: prompt, audio path, and target must be non-empty strings")
-
-        audio = Path(audio_path).expanduser()
-        if not audio.is_absolute():
-            audio = (root / audio).resolve()
-        return {
-            "audio": str(audio),
-            "prompt": prompt.strip(),
-            "target": target.strip(),
-        }
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index: int) -> dict[str, str]:
-        return self.samples[index]
+    Returns the list of encoder-tail params to re-enable *after* peft wrapping
+    (so ``--unfreeze_encoder_layers`` survives LoRA's base freeze).
+    """
+    tail_params: list = []
+    if args.freeze_whisper_encoder:
+        freeze_module(model, "model.whisper_encoder", freeze=True)
+        n = int(args.unfreeze_encoder_layers)
+        if n > 0:
+            encoder = model.model.whisper_encoder
+            layers = getattr(encoder, "layers", None)
+            if layers is not None:
+                n = min(n, len(layers))
+                tail_params = [p for layer in layers[-n:] for p in layer.parameters()]
+    if not args.train_vq_adaptor and not args.use_lora:
+        freeze_module(model, "model.vq_adaptor", freeze=True)
+    return tail_params
 
 
-class DataCollator:
-    def __init__(self, processor, max_length: int):
-        self.processor = processor
-        self.max_length = max_length
-        self.sample_rate = int(processor.feature_extractor.sampling_rate)
+def apply_lora(model, args: ScriptArguments):
+    """Wrap the LM with LoRA adapters; keep VQAdaptor trainable if requested."""
+    from peft import LoraConfig, get_peft_model
 
-    def __call__(self, samples: list[dict[str, str]]) -> dict[str, torch.Tensor]:
-        prompts, texts, audios = [], [], []
-        for sample in samples:
-            prompt = self.processor.apply_chat_template(
-                build_transcription_messages(sample["audio"], sample["prompt"]),
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            prompts.append(prompt)
-            texts.append(prompt + sample["target"] + self.processor.tokenizer.eos_token)
-            audio, sample_rate = sf.read(sample["audio"], dtype="float32", always_2d=True)
-            audio = audio.mean(axis=1)
-            if sample_rate != self.sample_rate:
-                audio = soxr.resample(audio, sample_rate, self.sample_rate)
-            audios.append(audio)
+    target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+    config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    # hold adaptor params so we can re-enable them after peft freezes the base
+    adaptor_params = list(model.model.vq_adaptor.parameters())
+    model = get_peft_model(model, config)
+    if args.train_vq_adaptor:
+        for param in adaptor_params:
+            param.requires_grad_(True)
+    model.print_trainable_parameters()
+    return model
 
-        batch = self.processor(
-            text=texts,
-            audio=audios,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        audio_lengths = torch.zeros(len(samples), dtype=torch.long)
-        audio_lengths.scatter_add_(
-            0,
-            batch["audio_chunk_mapping"].cpu(),
-            batch["audio_feature_lengths"].cpu(),
-        )
 
-        labels = batch["input_ids"].clone()
-        for index, (prompt, audio_length) in enumerate(zip(prompts, audio_lengths.tolist())):
-            prompt_ids = self.processor.expand_audio_token(
-                prompt,
-                audio_length,
-                self.max_length,
-            )
-            labels[index, : len(prompt_ids)] = -100
-        labels[batch["attention_mask"] == 0] = -100
-        batch["labels"] = labels
-        return dict(batch)
+def preprocess_logits_for_metrics(logits, labels):
+    """Argmax to int to avoid materializing the full [B, T, V] float tensor."""
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return logits.argmax(dim=-1)
 
 
 def main() -> None:
@@ -130,10 +107,32 @@ def main() -> None:
         script_args.model_name_or_path,
         trust_remote_code=True,
     )
-    dataset = ConversationDataset(script_args.train_jsonl)
-    collator = DataCollator(processor, script_args.max_length)
+    prompt_pool = build_prompt_pool(script_args.prompt_pool_file)
 
-    dtype = torch.bfloat16 if training_args.bf16 else torch.float16 if training_args.fp16 else torch.float32
+    train_dataset = ConversationDataset(
+        script_args.train_jsonl,
+        prompt_pool=prompt_pool,
+        prompt_pool_prob=script_args.prompt_pool_prob,
+        seed=script_args.seed,
+    )
+    eval_dataset = None
+    if script_args.eval_jsonl:
+        eval_dataset = ConversationDataset(
+            script_args.eval_jsonl,
+            prompt_pool=prompt_pool,
+            prompt_pool_prob=0.0,
+            seed=script_args.seed,
+        )
+
+    collator = DataCollator(processor, script_args.max_length, script_args)
+
+    # length bucketing only helps (and is safest) in single-process training
+    if train_dataset.lengths is not None and training_args.world_size == 1:
+        training_args.group_by_length = True
+
+    dtype = (
+        torch.bfloat16 if training_args.bf16 else torch.float16 if training_args.fp16 else torch.float32
+    )
     model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name_or_path,
         trust_remote_code=True,
@@ -142,15 +141,28 @@ def main() -> None:
     )
     model.tie_weights()
     model.config.use_cache = False
-    model.config.text_config.use_cache = False
+    if hasattr(model.config, "text_config"):
+        model.config.text_config.use_cache = False
 
-    trainer = Trainer(
+    encoder_tail_params = apply_parameter_strategy(model, script_args)
+    if script_args.use_lora:
+        model = apply_lora(model, script_args)
+    # re-enable encoder tail after (optional) LoRA wrap, so it survives peft's base freeze
+    for param in encoder_tail_params:
+        param.requires_grad_(True)
+
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=collator,
         processing_class=processor,
+        compute_metrics=compute_token_accuracy if eval_dataset is not None else None,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset is not None else None,
     )
+    trainer.loss_chunk_size = script_args.loss_chunk_size
+
     result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model()
     trainer.save_state()
