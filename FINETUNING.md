@@ -162,6 +162,21 @@ Mitigations, in order of effectiveness for full-length training:
 
 For most meeting-domain adaptation, `--loss_window 8192` on a single 80 GB card is the simplest path to 90-min training. Use multi-GPU (DDP) to scale throughput once one sample fits.
 
+## Audio longer than ~90 min (segmentation)
+
+The model's context is ~128k tokens (~90 min). Audio longer than that **cannot** be fed as one sequence regardless of GPU count -- it is a context-window limit, not a memory limit. Multi-GPU does not help here. You must segment first:
+
+```bash
+# cut 5h audio + transcripts into <=60-min segments (16 kHz mono, time-shifted)
+python scripts/segment_long.py --input raw.jsonl --segment_minutes 60 \
+  --output raw_seg.jsonl --audio_out data/seg
+# then prepare + train as usual (each segment <= 90 min, fits with --loss_window)
+python prepare_data.py --input_jsonl raw_seg.jsonl --output_dir data --train_split 0.95
+python finetune.py --train_jsonl data/train.jsonl ... --max_length 131072 --loss_window 8192
+```
+
+Each segment's transcript is time-shifted to start at 0.0. For 5h audio this yields ~5 segments; train each with `--loss_window` (single card) or across cards with DDP (throughput).
+
 ## Notes
 
 - `max_length` 65536 covers ~52 minutes of meeting audio in one pass (12.5 audio tokens/sec after 4x merge); offline you can afford full-length, unchunked training.
