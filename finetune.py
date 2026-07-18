@@ -162,6 +162,7 @@ def main() -> None:
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset is not None else None,
     )
     trainer.loss_chunk_size = script_args.loss_chunk_size
+    trainer.loss_window = script_args.loss_window
 
     result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model()

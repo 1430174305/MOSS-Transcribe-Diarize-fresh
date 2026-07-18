@@ -151,13 +151,16 @@ The model itself supports ~90 min of audio at the default `max_length=131072` (1
 
 Mitigations, in order of effectiveness for full-length training:
 
-1. **Liger fused linear-CE** (`pip install liger-kernel`, `--use_liger_kernel true`): fuses `lm_head` + CE so the `[T, V]` logits are never materialized. This is the proper way to train at 131072. It requires the custom model's loss path to use the fused kernel — wire it in `modeling_moss_transcribe_diarize.py` if you go this route.
-2. **Shorter training windows**: train on ≤ `max_length` windows (e.g. 32768, ~26 min) via `prepare_data.py` segmentation. Domain adaptation transfers from shorter clips; the model keeps its 90-min inference ability. Low-risk, recommended unless you must adapt long-context behavior specifically.
-3. The cross-entropy is already chunked over time (`--loss_chunk_size 8192`), which kills the ~40 GB softmax buffer but not the logits tensor itself.
-4. `--gradient_checkpointing` trades ~25% speed for activation savings.
-5. FSDP shards params/optimizer/grads across cards, and if `lm_head`/embeddings are sharded each rank computes a vocab slice → `[T, V/n]` logits. Use `--fsdp "full_shard"` for multi-card memory pressure.
+1. **Windowed loss (recommended, now built-in)**: `--loss_window 8192` (or 16384). The decoder still runs the **full** long forward (long-range attention is exercised, so long-context diarization is actually trained), but the `lm_head` + CE only operate on a random sub-window of W tokens per step, so only `[W, V]` logits are materialized instead of `[T, V]`. Since `hidden_states` is 1024-dim (90 min ≈ 0.27 GB), a single 80 GB card fits 90-min+ audio easily. Different windows across steps cover the whole sequence. This is the single-card fix for the 90-min OOM — no multi-GPU needed for the duration problem.
+2. **Liger fused linear-CE** (`pip install liger-kernel`, `--use_liger_kernel true`): fuses `lm_head` + CE so the `[T, V]` logits are never materialized. Alternative to windowed loss but needs wiring into the custom model's forward and is incompatible with per-token weighting.
+3. **Shorter training clips**: train on ≤ `max_length` windows (e.g. 32768, ~26 min) via `prepare_data.py` segmentation. Domain adaptation transfers from shorter clips; the model keeps its 90-min inference ability. Use this if you do not specifically need long-context adaptation.
+4. The cross-entropy is already chunked over time (`--loss_chunk_size 8192`), which kills the ~40 GB softmax buffer but not the logits tensor itself (windowed loss above handles that).
+5. `--gradient_checkpointing` trades ~25% speed for activation savings.
+6. **FSDP with vocab sharding**: shards `lm_head`/embeddings so each rank computes `[T, V/n]` logits — scales duration ~linearly with cards. High-risk for this custom tied-weight model; prefer windowed loss on a single card.
 
-For most meeting-domain adaptation, option 2 (shorter training windows) is sufficient and does not sacrifice the 90-min capability. Use option 1 (Liger) only if you need to train on full 90-min meetings in-context.
+**Multi-GPU note**: plain DDP (`torchrun`) does **not** extend single-sample duration — each rank replicates the full `[T, V]` logits. DDP only adds throughput (parallel samples). To train a single 90-min+ audio, use `--loss_window` (single card) or FSDP with vocab sharding (multi-card).
+
+For most meeting-domain adaptation, `--loss_window 8192` on a single 80 GB card is the simplest path to 90-min training. Use multi-GPU (DDP) to scale throughput once one sample fits.
 
 ## Notes
 

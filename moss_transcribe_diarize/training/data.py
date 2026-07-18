@@ -36,6 +36,11 @@ class ScriptArguments:
     loss_weight_base: float = 1.0
     # memory: chunk the cross-entropy over time to avoid materializing [T, V] softmax
     loss_chunk_size: int = 8192
+    # memory: window the loss to fit very long audio on a single card.
+    # 0 = off (full-sequence CE, needs full [T, V] logits); >0 = supervise a
+    # random sub-window of this many tokens per step, hidden_states are tiny so
+    # the lm_head only sees [W, V]. Decoder still runs the FULL long forward.
+    loss_window: int = 0
     # parameter strategy
     freeze_whisper_encoder: bool = field(default=True, metadata={"help": "Freeze the Whisper audio encoder."})
     unfreeze_encoder_layers: int = field(default=0, metadata={"help": "If >0, unfreeze the last N encoder layers (0 = fully frozen)."})
