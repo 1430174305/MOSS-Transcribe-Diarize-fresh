@@ -83,6 +83,12 @@ def merge(windows: list[dict]) -> tuple[list[TranscriptSegment], dict]:
                 kept.append((seg, i, s.speaker))
     kept.sort(key=lambda x: (x[0].start, x[0].end))
 
+    # TODO(truncation detection): if a window's last kept segment has
+    # |seg.end - window_end| < eps (~0.3s), it was likely rigid-cut mid-turn.
+    # Drop it and rescue the next window's complete version of that turn.
+    # Skipped here because VAD cuts at silence make this rare; needed only for
+    # the rigid-fallback path. See docs/scheme.html §4.3.
+
     # unique global renumber per (window, local_label) -- no false merges
     mapping: dict[tuple[int, str], str] = {}
     g = 0
