@@ -105,31 +105,31 @@
 <li>收集 <code>{offset:start, end:end, transcript}</code>(transcript 用 local 时间戳)</li>
 </ul>
 
-<h2>4. 文本 + 时间戳合并(merge_windows)</h2>
+<h2>4. 文本 + 时间戳合并(前窗为准)</h2>
 
-<h3>4.1 中点带去重</h3>
-<p>相邻窗重叠 ~3-4min。重叠区取<b>中点 m</b>,左半归左窗、右半归右窗;每段按<b>起点</b>归到唯一窗,整段保留(不切文本)。</p>
+<h3>4.1 前窗为准</h3>
+<p>相邻窗重叠 ~3-4min。<b>前窗(窗 N-1)为准</b>:前窗拥有 <code>[.., end_{N-1}]</code>,后窗(窗 N)拥有 <code>(end_{N-1}, ..]</code>;重叠区里后窗的转写<b>文本丢弃</b>(它不是废的——见 §5,用于说话人匹配)。</p>
+<p>这样文本交接点 = 前窗 <code>end</code> = <b>VAD 静音处</b>(turn 间隙),是自然边界,而不是任意"重叠区时间中点"。后窗从该静音之后开始贡献。</p>
 
-<pre>窗1 end=E1, 窗2 start=S2, 重叠 [S2, E1], 中点 m=(S2+E1)/2
-窗1 可信带 [.., m], 窗2 可信带 [m, ..]
-段起点 &lt; m  → 窗1 保留(整段),窗2 丢
-段起点 ≥ m  → 窗2 保留(整段),窗1 丢
-→ 不重、不漏、不切文本</pre>
+<pre>窗1 end = E1(= VAD 静音切点)
+窗1 拥有 [0, E1]                  ← 重叠区文本也归窗1
+窗2 拥有 (E1, E2]                 ← 后窗从静音之后开始;重叠区 [S2, E1] 的窗2文本丢弃
+→ 不重、不漏、不切文本,边界落在静音</pre>
 
-<h3>4.2 直观例子:一段会议跨过重叠区</h3>
-<p>设窗1 <code>end=21.5</code>,窗2 <code>start=18.5</code>,重叠 <code>[18.5, 21.5]</code>,中点 <code>m=20.0</code>。三段话(全局时间):</p>
+<h3>4.2 直观例子:一段会议跨过切点</h3>
+<p>设窗1 <code>end=21:5</code>(VAD 命中静音),窗2 <code>start=18:5</code>,重叠 <code>[18:5, 21:5]</code>。三段话(全局时间):</p>
 
 <table>
-<tr><th>段(全局时间)</th><th>起点</th><th>在中点哪侧</th><th>窗1 有?</th><th>窗2 有?</th><th>谁保留</th></tr>
-<tr><td class="seg">A [18:50][S01]那我们看下一个议题[19:05]</td><td>18:50</td><td>左(&lt;20:00)</td><td class="yes">✅完整</td><td class="yes">✅完整</td><td><b>窗1</b></td></tr>
-<tr><td class="seg">B [19:10][S02]性能优化我压到50ms[20:55]</td><td>19:10</td><td>左(&lt;20:00)</td><td class="yes">✅完整</td><td class="no">⚠️残段(19:10-20:55 头在窗1)</td><td><b>窗1 完整版</b>;窗2 残段丢</td></tr>
-<tr><td class="seg">C [21:00][S03]测试报告明天给[21:30]</td><td>21:00</td><td>右(&gt;20:00)</td><td class="no">❌(超窗1终 21:30)</td><td class="yes">✅完整</td><td><b>窗2</b></td></tr>
+<tr><th>段(全局时间)</th><th>窗1 有?</th><th>窗2 有?</th><th>前窗为准 → 谁保留</th></tr>
+<tr><td class="seg">A [18:50][S01]那我们看下一个议题[19:05]</td><td class="yes">✅完整</td><td class="yes">✅(重叠区)</td><td><b>窗1</b>保留;窗2 重叠区文本丢</td></tr>
+<tr><td class="seg">B [19:10][S02]性能优化我压到50ms[20:55]</td><td class="yes">✅完整(20:55 &lt; 切点21:5)</td><td class="yes">✅(重叠区)</td><td><b>窗1</b>保留(完整);窗2 丢</td></tr>
+<tr><td class="seg">C [21:10][S03]测试报告明天给[21:30]</td><td class="no">❌(晚于窗1终21:5)</td><td class="yes">✅完整</td><td><b>窗2</b>保留(切点之后)</td></tr>
 </table>
 
-<div class="note"><b>关键:</b>窗1 切在 21:5(静音处)→ 段 B 在窗1 里是<b>完整</b>的(19:10-20:55 &lt; 21:5)。窗2 也有 B 但是<b>残段</b>(从 18:5 才开始听,缺 18:5 之前的头)→ 被丢,留窗1 完整版。<b>VAD 切静音 = turn 不截断</b>,这是整个方案能干净合并的地基。</div>
+<div class="note"><b>关键:</b>窗1 切在 21:5 静音 → 段 B 在窗1 里是<b>完整</b>的(20:55 &lt; 21:5,turn 在静音前结束)。前窗为准直接留窗1 完整版,窗2 重叠区的 B 丢弃。<b>VAD 切静音 = turn 不截断 = 前窗为准能干净工作</b>。重叠区窗2 的转写不浪费——§5 用它算 embedding 做说话人匹配。</div>
 
 <h3>4.3 截断检测(兜底强切)</h3>
-<p>若某段 <code>end</code> 落在某窗 <code>end</code> 的 ε(0.3s)内 → 判为疑似强切截断 → 改留<b>下一窗</b>的完整版。这是无 VAD 命中时的兜底。</p>
+<p>若前窗末段 <code>end</code> 落在前窗 <code>end</code> 的 ε(0.3s)内 → 判为<b>疑似强切截断</b>(无 VAD 命中、turn 被切)→ 改留<b>后窗</b>的完整版。这是对"前窗为准"在强切场景的精准修补,比中点带更对症。</p>
 
 <h2>5. 跨窗说话人匹配(核心 <b>①</b>)</h2>
 <p>目标:把每窗本地 <code>[S01]</code> 映射到<b>全局一致 ID</b>。利用<b>重叠区</b>做"同时间同说话人"的对齐证据。</p>
@@ -178,9 +178,9 @@
   │     ↓ 每窗 [start, end]
   ├─ ffmpeg 切 + generate_transcription → 每窗 transcript(local)
   │     ↓ windows = [{offset, end, transcript}]
-  ├─ merge_windows.merge → 文本+时间戳合并(中点去重 + 截断检测)
-  │     ↓ 全局时间戳文本(说话人仍是 local 标签)
-  ├─ speaker encoder → 每段 embedding(+ 置信度,短段降权/丢)
+  ├─ merge_windows.merge → 文本+时间戳合并(前窗为准 + 截断检测)
+  │     ↓ 全局时间戳文本(说话人仍是 local 标签);重叠区文本归前窗、后窗重叠区文本丢
+  ├─ speaker encoder → 每段 embedding(+ 置信度,短段降权/丢)【两窗重叠区段都算,用于 1:1】
   ├─ 重叠区 1:1 对应 → 高置信直接合并;对不上 → 全局余弦重分配
   │     ↓ 全局说话人 ID
   └─ 输出 merged.txt(全局时间戳 + 全局说话人)</pre>

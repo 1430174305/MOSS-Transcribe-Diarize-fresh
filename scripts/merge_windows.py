@@ -5,13 +5,12 @@ Each window is an audio chunk (~30 min, optionally overlapping neighbors). Each
 window's transcript has LOCAL timestamps (start at 0.0). This script:
 
 1. shifts each window's segments to global time (add the window offset),
-2. computes a "trusted range" [L_i, R_i] per window: the midpoint of each
-   overlap goes to the window whose interior is on that side,
-3. keeps a segment from window i iff its global START falls in [L_i, R_i]
-   (so every global time is owned by exactly one window -- no text is cut,
-   no duplicates),
-4. sorts by global start,
-5. renumbers speakers GLOBALLY but UNIQUELY per (window, local_label) -- this
+2. assigns each segment to a window by "front window wins": window i owns
+   [prev_end, end_i]; the previous window owns the head overlap (its tail), so
+   the text boundary falls at the previous window's end (= the VAD silence cut
+   point) rather than an arbitrary time midpoint,
+3. sorts by global start,
+4. renumbers speakers GLOBALLY but UNIQUELY per (window, local_label) -- this
    is a SAFE default that never false-merges two different people. To collapse
    same-person across windows, feed the output mapping into a speaker-encoder
    step (global_diarize.py) that refines (window, local) -> true global ID.
@@ -48,10 +47,13 @@ def window_end(w: dict) -> float:
 def trusted_ranges(windows: list[dict]) -> list[tuple[float, float]]:
     """[L_i, R_i]: keep a segment from window i iff its start is in here.
 
-    - L_i = midpoint of the head overlap (with window i-1), else S_i.
-    - R_i = midpoint of the tail overlap (with window i+1), else E_i.
-    The LEFT half of an overlap is owned by the LEFT window, the RIGHT half by
-    the RIGHT window -- each side goes to the window whose interior is closer.
+    "Front window wins": window i owns ``[prev_end, end_i]`` -- the previous
+    window owns the head overlap (its tail), so window i starts contributing only
+    after the previous window's end (= the VAD silence cut point). This puts the
+    text boundary at the natural silence rather than an arbitrary time midpoint.
+    For the first window, L_0 = its offset. The overlap region's text from the
+    later window is discarded here (it is still used for speaker matching
+    upstream, not for text merge).
     """
     n = len(windows)
     ends = [window_end(w) for w in windows]
@@ -59,17 +61,11 @@ def trusted_ranges(windows: list[dict]) -> list[tuple[float, float]]:
     for i, w in enumerate(windows):
         S = float(w["offset"])
         E = ends[i]
-        L = S
-        R = E
-        if i > 0:  # head overlap with previous window
-            prev_E = ends[i - 1]
-            if S < prev_E:
-                L = (S + prev_E) / 2.0
-        if i < n - 1:  # tail overlap with next window
-            nxt_S = float(windows[i + 1]["offset"])
-            if nxt_S < E:
-                R = (nxt_S + E) / 2.0
-        ranges.append((L, R))
+        if i > 0 and S < ends[i - 1]:  # head overlap with previous window
+            L = ends[i - 1]            # previous window owns the overlap
+        else:
+            L = S
+        ranges.append((L, E))
     return ranges
 
 
