@@ -36,7 +36,7 @@
 <body>
 
 <h1>MOSS-Transcribe-Diarize 长音频推理方案</h1>
-<p>针对超过模型上下文(~90min)的长音频,采用 <b>VAD 静音切窗 + 重叠 + 中点去重 + 跨窗说话人匹配</b> 流水线,产出全局时间戳、全局一致说话人标签的完整转写。本方案含三项关键增强:<b>①</b>重叠区按说话人 1:1 对应合并、<b>②</b>剩余音频够短则整段推理、<b>③</b>短段 embedding 降置信/丢弃。</p>
+<p>针对超过模型上下文(~90min)的长音频,采用 <b>VAD 静音切窗 + 重叠 + 前窗为准合并 + 跨窗说话人匹配</b> 流水线,产出全局时间戳、全局一致说话人标签的完整转写。本方案含三项关键增强:<b>①</b>重叠区按说话人 1:1 对应合并、<b>②</b>剩余音频够短则整段推理、<b>③</b>短段 embedding 降置信/丢弃。</p>
 
 <h2>1. 参数</h2>
 <table>
@@ -117,16 +117,16 @@
 → 不重、不漏、不切文本,边界落在静音</pre>
 
 <h3>4.2 直观例子:一段会议跨过切点</h3>
-<p>设窗1 <code>end=21:5</code>(VAD 命中静音),窗2 <code>start=18:5</code>,重叠 <code>[18:5, 21:5]</code>。三段话(全局时间):</p>
+<p>设窗1 <code>end=21:05</code>(VAD 命中静音),窗2 <code>start=18:05</code>,重叠 <code>[18:05, 21:05]</code>。三段话(全局时间,mm:ss):</p>
 
 <table>
 <tr><th>段(全局时间)</th><th>窗1 有?</th><th>窗2 有?</th><th>前窗为准 → 谁保留</th></tr>
 <tr><td class="seg">A [18:50][S01]那我们看下一个议题[19:05]</td><td class="yes">✅完整</td><td class="yes">✅(重叠区)</td><td><b>窗1</b>保留;窗2 重叠区文本丢</td></tr>
-<tr><td class="seg">B [19:10][S02]性能优化我压到50ms[20:55]</td><td class="yes">✅完整(20:55 &lt; 切点21:5)</td><td class="yes">✅(重叠区)</td><td><b>窗1</b>保留(完整);窗2 丢</td></tr>
-<tr><td class="seg">C [21:10][S03]测试报告明天给[21:30]</td><td class="no">❌(晚于窗1终21:5)</td><td class="yes">✅完整</td><td><b>窗2</b>保留(切点之后)</td></tr>
+<tr><td class="seg">B [19:10][S02]性能优化我压到50ms[20:55]</td><td class="yes">✅完整(20:55 &lt; 切点21:05)</td><td class="yes">✅(重叠区)</td><td><b>窗1</b>保留(完整);窗2 丢</td></tr>
+<tr><td class="seg">C [21:10][S03]测试报告明天给[21:30]</td><td class="no">❌(晚于窗1终21:05)</td><td class="yes">✅完整</td><td><b>窗2</b>保留(切点之后)</td></tr>
 </table>
 
-<div class="note"><b>关键:</b>窗1 切在 21:5 静音 → 段 B 在窗1 里是<b>完整</b>的(20:55 &lt; 21:5,turn 在静音前结束)。前窗为准直接留窗1 完整版,窗2 重叠区的 B 丢弃。<b>VAD 切静音 = turn 不截断 = 前窗为准能干净工作</b>。重叠区窗2 的转写不浪费——§5 用它算 embedding 做说话人匹配。</div>
+<div class="note"><b>关键:</b>窗1 切在 21:05 静音 → 段 B 在窗1 里是<b>完整</b>的(20:55 &lt; 21:05,turn 在静音前结束)。前窗为准直接留窗1 完整版,窗2 重叠区的 B 丢弃。<b>VAD 切静音 = turn 不截断 = 前窗为准能干净工作</b>。重叠区窗2 的转写不浪费——§5 用它算 embedding 做说话人匹配。</div>
 
 <h3>4.3 截断检测(兜底强切)</h3>
 <p>若前窗末段 <code>end</code> 落在前窗 <code>end</code> 的 ε(0.3s)内 → 判为<b>疑似强切截断</b>(无 VAD 命中、turn 被切)→ 改留<b>后窗</b>的完整版。这是对"前窗为准"在强切场景的精准修补,比中点带更对症。</p>
@@ -135,38 +135,58 @@
 <p>目标:把每窗本地 <code>[S01]</code> 映射到<b>全局一致 ID</b>。利用<b>重叠区</b>做"同时间同说话人"的对齐证据。</p>
 
 <h3>5.1 每窗提取 speaker embedding</h3>
+<p><b>encoder 选型(二选一,须是 speaker-trained,不能用 Whisper encoder):</b></p>
 <ul>
-<li>按 MOSS 段的 <code>[start][Sxx]text[end]</code> 从音频切出每个说话人的语音段;</li>
-<li>每段过 speaker encoder → embedding;</li>
-<li>按 <code>(窗, 本地标签)</code> 聚合 → <b>加权均值</b>(权重 = 置信度,见 §6)。</li>
+<li><b>SpeechBrain ECAPA-TDNN</b>(<code>spkrec-ecapa-voxceleb</code>):纯 pip,192 维,开箱即用,推荐起步;</li>
+<li><b>pyannote/embedding</b>(WavLM 系):diarization 标配,质量更高,但要 accept license + HF token。</li>
+</ul>
+<p><b>提取流程:</b></p>
+<ul>
+<li>按 MOSS 段的 <code>[start][Sxx]text[end]</code> 从<b>对应窗的音频</b>切出每个说话人的语音段(局部时间,窗内切片);</li>
+<li>每段过 speaker encoder → embedding(归一化到单位长度);</li>
+<li>段级置信度 <code>c_seg</code> 见 §6;</li>
+<li>按 <code>(窗 i, 本地标签 L)</code> 聚合:<code>v_{i,L} = Σ(c_seg · emb_seg) / Σ(c_seg)</code>(置信度加权均值)。</li>
 </ul>
 
-<h3>5.2 重叠区 1:1 对应(优先路径)</h3>
+<h3>5.2 顺序流程 + 重叠区 1:1 对应(优先路径 <b>①</b>)</h3>
 <div class="new">
-在相邻窗 N-1 / N 的重叠区,两窗都有段和说话人。把重叠区<b>按说话人切开</b>:
+<b>按窗顺序处理</b>(窗1 → 窗2 → …),维护一个全局说话人注册表 G。每来一窗 N:
 <ol>
-<li>对重叠区里两窗各自的 local 说话人,各算 embedding + 置信度;</li>
-<li>尝试 <b>1:1 对应</b>(Hungarian):若每对余弦 ≥ 阈值 → 认为这些 local 说话人<b>就是同一全局说话人</b>(重叠区=同时间,直接对齐,高置信);</li>
-<li><b>若对不上</b>(某对余弦 &lt; 阈值,或人数不等)→ 说明某窗转写/切分有错 → 进入 5.3。</li>
+<li>对相邻窗 N-1 / N 的重叠区,两窗都有段和说话人。把重叠区<b>按说话人切开</b>,各算聚合 embedding + 置信度;</li>
+<li><b>1:1 对应</b>:构建代价矩阵 <code>cost[i][j] = 1 - cos(v_{N-1, L_i}, v_{N, L_j})</code>,Hungarian 求最小总代价匹配;</li>
+<li><b>采信判据</b>:若<b>所有</b>匹配对的 <code>cos ≥ 阈值</code>(且双方置信度都不低)→ 整组采信,这些 local 标签直接对齐为同一全局 ID(把 N 的 local 映射到 N-1 已有的全局 ID);</li>
+<li><b>对不上</b>(任一对 cos &lt; 阈值,或重叠区人数不等)→ 整组不采信 → N 中未对上的 local 进入 5.3。</li>
 </ol>
 </div>
 
 <h3>5.3 全局余弦重分配(回退路径)</h3>
-<p>对没对上的 local 说话人,跨<b>全窗</b>算 embedding 余弦,诊断哪部分错了:</p>
+<p>对没对上的 local 说话人,跨<b>全窗已有全局注册表 G</b>算余弦,诊断哪部分错了:</p>
 <ul>
-<li>余弦 ≥ 阈值 → 合并到已有全局 ID;</li>
-<li>都低于阈值 → 开新全局 ID;</li>
+<li>余弦 ≥ 阈值 → 合并到该全局 ID;</li>
+<li>都低于阈值 → 开新全局 ID,加入 G;</li>
 <li>冲突(一个 local 对上多个全局 / 多个 local 对上一个全局)→ 取最高余弦,其余开新 ID 或标记待人工复核。</li>
 </ul>
-<div class="note"><b>逻辑:</b>重叠区能对上的直接确认(强证据),对不上的退到全局相似度找错并重分配。这样既利用了重叠的同时间证据,又能诊断哪窗切错了。</div>
+<div class="note"><b>逻辑:</b>重叠区能对上的直接确认(同时间=强证据,高置信),对不上的退到全局相似度找错并重分配。这样既利用了重叠的同时间证据,又能诊断哪窗切错了。</div>
 
 <h2>6. 置信度与短段(<b>③</b>)</h2>
 <div class="new">短段 embedding 不可靠,需差异化处理:
 <ul>
-<li>段 <b>&lt; 2s</b> → <b>降低置信度</b>(聚合时降权,不主导该说话人向量);</li>
-<li>段 <b>&lt; 0.5s</b> → <b>直接丢弃</b>,不参与 embedding 聚合;</li>
-<li>置信度 = f(总语音时长, 段数, 平均段长, 自一致性);</li>
-<li>用途:重叠 1:1 是否采信(低置信 → 不采信,走 5.3);聚合权重;冲突时优先高置信。</li>
+<li>段 <b>&lt; 0.5s</b>(<code>drop_embedding_seconds</code>)→ <b>直接丢弃</b>,不参与 embedding 聚合;</li>
+<li>段 <b>&lt; 2s</b>(<code>short_embedding_seconds</code>)→ <b>降权</b>,在聚合里贡献降低;</li>
+</ul>
+<p><b>段级置信度公式:</b></p>
+<pre>c_seg = duration_factor × self_consistency
+
+duration_factor = clamp(total_speech_s / 10, 0, 1)         # 10s 满分,线性,短段低
+self_consistency = cos(emb_first_half, emb_second_half)     # 段切两半各 embed,余弦
+                   (段太短切不了两半 → self_consistency = duration_factor)
+</pre>
+<p>即:够长且段内音色稳定 → 高置信;短或段内音色漂(混入他人/噪声)→ 低置信。</p>
+<p><b>用途:</b></p>
+<ul>
+<li>聚合权重:§5.1 的 <code>v_{i,L} = Σ(c_seg · emb) / Σ(c_seg)</code>;</li>
+<li>重叠 1:1 采信:双方置信度都低 → 不采信,走 5.3;</li>
+<li>冲突仲裁:多个候选同分时,优先高置信的匹配。</li>
 </ul>
 </div>
 
@@ -191,6 +211,11 @@
 <li><code>windows.json</code>:每窗 offset/end/transcript(调试)</li>
 <li><code>speaker_mapping.json</code>:(窗,本地)→ 全局 ID + 置信度</li>
 </ul>
+<p><b>merged.txt 样例(全局时间戳,跨窗说话人已统一为 S01/S02/S03):</b></p>
+<pre>[0.48][S01]Welcome everyone[1.66][12.26][S02]The new pipeline is ready[13.81]
+[14.36][S01]Great, include the diarization results[18.76]
+[19.20][S03]Testing report tomorrow[21.30]
+... (后续来自窗2、窗3,但 S01/S02/S03 跨窗一致)</pre>
 
 <h2>9. 边界与限制</h2>
 <ul>
