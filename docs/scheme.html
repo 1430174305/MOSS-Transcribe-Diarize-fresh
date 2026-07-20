@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MOSS 长音频推理方案</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;max-width:980px;margin:24px auto;line-height:1.65;color:#1f2328;padding:0 18px}
+  h1{font-size:1.6em;border-bottom:2px solid #2c3e50;padding-bottom:.3em}
+  h2{color:#2c3e50;margin-top:2em;border-left:5px solid #2c3e50;padding-left:.55em}
+  h3{color:#34495e;margin-top:1.4em}
+  table{border-collapse:collapse;width:100%;margin:1em 0;font-size:.95em}
+  th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;vertical-align:top}
+  th{background:#f6f8fa}
+  code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:.92em}
+  pre{background:#f6f8fa;padding:12px 14px;border-radius:6px;overflow-x:auto;font-size:.88em;line-height:1.45}
+  .note{background:#fff8c5;border-left:4px solid #d4a72c;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
+  .new{background:#dafbe1;border-left:4px solid #2da44e;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
+  .warn{background:#ffe5e5;border-left:4px solid #cf222e;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
+  /* timeline visual */
+  .tl{position:relative;height:54px;margin:14px 0 6px}
+  .bar{position:absolute;height:22px;border-radius:3px;font-size:11px;color:#fff;line-height:22px;padding:0 6px;white-space:nowrap}
+  .b0{background:#2c7be5}     /* window0 */
+  .b1{background:#8e44ad}     /* window1 */
+  .b2{background:#16a085}     /* window2 */
+  .ov{background:#f0a020;color:#3a2a00}        /* overlap */
+  .tick{position:absolute;top:0;height:40px;border-left:1px dashed #888;font-size:10px;color:#666;padding-left:2px}
+  .legend span{display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:4px;vertical-align:middle}
+  .legend b{margin-right:16px}
+  .seg{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em}
+  .yes{color:#1a7f37;font-weight:bold}
+  .no{color:#cf222e;font-weight:bold}
+</style>
+</head>
+<body>
+
+<h1>MOSS-Transcribe-Diarize 长音频推理方案</h1>
+<p>针对超过模型上下文(~90min)的长音频,采用 <b>VAD 静音切窗 + 重叠 + 中点去重 + 跨窗说话人匹配</b> 流水线,产出全局时间戳、全局一致说话人标签的完整转写。本方案含三项关键增强:<b>①</b>重叠区按说话人 1:1 对应合并、<b>②</b>剩余音频够短则整段推理、<b>③</b>短段 embedding 降置信/丢弃。</p>
+
+<h2>1. 参数</h2>
+<table>
+<tr><th>参数</th><th>默认</th><th>含义</th></tr>
+<tr><td><code>target_minutes (T)</code></td><td>20</td><td>基准窗长(标称切点 0/20/40/60…)</td></tr>
+<tr><td><code>tolerance_minutes (L)</code></td><td>2</td><td>切点搜索容差;重叠 ~2L = 4min</td></tr>
+<tr><td><code>max_remaining_minutes</code></td><td>30</td><td><b>②</b> 剩余 ≤ 此值则整段推理,不再切</td></tr>
+<tr><td><code>min_gap_seconds</code></td><td>1.0</td><td>VAD 静音最短,过滤句中微停顿</td></tr>
+<tr><td><code>min_segment_seconds</code></td><td>10</td><td>窗短于此则并入上窗或丢</td></tr>
+<tr><td><code>short_embedding_seconds</code></td><td>2.0</td><td><b>③</b> 段短于此 → embedding 置信度降权</td></tr>
+<tr><td><code>drop_embedding_seconds</code></td><td>0.5</td><td><b>③</b> 段短于此 → 直接丢弃,不参与 embedding</td></tr>
+<tr><td><code>speaker_match_threshold</code></td><td>0.6</td><td>余弦判同人阈值(需校准)</td></tr>
+</table>
+
+<h2>2. 切窗算法(绝对标称锚定,不累积漂移)</h2>
+<p>标称切点在 <b>0, 20, 40, 60…</b>。每个边界在标称点 ±L 内用 VAD 找静音,头取<b>最早</b>(最靠标称-L)、尾取<b>最晚</b>(最靠标称+L),使两窗边界都落在 turn 间隙 → turn 完整。无 VAD 则强切。</p>
+
+<pre>窗1: start = 0,                                end = VAD∈[20,22] 取最靠近 22(最晚)
+窗2: start = VAD∈[18,20] 取最靠近 18(最早),  end = VAD∈[40,42] 取最靠近 42(最晚)
+窗3: start = VAD∈[38,40] 取最靠近 38(最早),  end = VAD∈[60,62] 取最靠近 62(最晚)
+...
+无 VAD → 头部强切 18(标称-2)、尾部强切 22(标称+2)
+
+举例:
+  窗1 end  = 21.5,  窗2 start = 18.5  →  重叠 [18.5, 21.5] ≈ 3min
+  极端(头18/尾22)                   →  重叠满 4min</pre>
+
+<div class="note"><b>头取最早、尾取最晚</b> = 安全拉满:每窗尽量长、重叠尽量大,给"turn 跨切点"留最大缓冲(没人连讲 4min 不停顿,所以碎片化几乎不可能)。</div>
+
+<div class="new"><b>② max_remaining:</b> 规划下一窗前,若 <code>剩余时长 D - cursor ≤ 30min</code>,直接把剩余<b>整段</b>作为最后一窗(end=D,停止切)。避免末尾出现"20-25min,切了不如不切"的小窗。</div>
+
+<h3>2.1 三个窗的直观示意</h3>
+
+<div class="legend">
+  <span class="b0"></span><b>窗1</b>
+  <span class="b1"></span><b>窗2</b>
+  <span class="b2"></span><b>窗3</b>
+  <span class="ov"></span><b>重叠区</b>
+</div>
+
+<div class="tl">
+  <div class="tick" style="left:0%">0</div>
+  <div class="tick" style="left:29%">18</div>
+  <div class="tick" style="left:32%">20</div>
+  <div class="tick" style="left:35%">22</div>
+  <div class="tick" style="left:61%">38</div>
+  <div class="tick" style="left:65%">40</div>
+  <div class="tick" style="left:68%">42</div>
+  <div class="tick" style="left:97%">62</div>
+
+  <div class="bar b0" style="left:0%;width:34.5%;top:6px">窗1 [0 → 21.5]</div>
+  <div class="bar ov" style="left:29%;width:6.5%;top:6px;opacity:.85"></div>
+
+  <div class="bar b1" style="left:29%;width:36.5%;top:30px">窗2 [18.5 → 41.5]</div>
+  <div class="bar ov" style="left:61%;width:7%;top:30px;opacity:.85"></div>
+
+  <div class="bar b2" style="left:61%;width:36%;top:6px">窗3 [38.5 → 61]</div>
+</div>
+
+<p style="font-size:.9em;color:#666">虚线为标称切点;实色条为窗范围;橙条为相邻窗的重叠区(~3-4min)。</p>
+
+<h2>3. 每窗推理</h2>
+<ul>
+<li>ffmpeg <code>-ss start -t (end-start) -ac 1 -ar 16000</code> 切出 16k mono wav</li>
+<li><code>generate_transcription(do_sample=False, max_new_tokens=65536)</code> 贪心解码(离线要质量)</li>
+<li>收集 <code>{offset:start, end:end, transcript}</code>(transcript 用 local 时间戳)</li>
+</ul>
+
+<h2>4. 文本 + 时间戳合并(merge_windows)</h2>
+
+<h3>4.1 中点带去重</h3>
+<p>相邻窗重叠 ~3-4min。重叠区取<b>中点 m</b>,左半归左窗、右半归右窗;每段按<b>起点</b>归到唯一窗,整段保留(不切文本)。</p>
+
+<pre>窗1 end=E1, 窗2 start=S2, 重叠 [S2, E1], 中点 m=(S2+E1)/2
+窗1 可信带 [.., m], 窗2 可信带 [m, ..]
+段起点 &lt; m  → 窗1 保留(整段),窗2 丢
+段起点 ≥ m  → 窗2 保留(整段),窗1 丢
+→ 不重、不漏、不切文本</pre>
+
+<h3>4.2 直观例子:一段会议跨过重叠区</h3>
+<p>设窗1 <code>end=21.5</code>,窗2 <code>start=18.5</code>,重叠 <code>[18.5, 21.5]</code>,中点 <code>m=20.0</code>。三段话(全局时间):</p>
+
+<table>
+<tr><th>段(全局时间)</th><th>起点</th><th>在中点哪侧</th><th>窗1 有?</th><th>窗2 有?</th><th>谁保留</th></tr>
+<tr><td class="seg">A [18:50][S01]那我们看下一个议题[19:05]</td><td>18:50</td><td>左(&lt;20:00)</td><td class="yes">✅完整</td><td class="yes">✅完整</td><td><b>窗1</b></td></tr>
+<tr><td class="seg">B [19:10][S02]性能优化我压到50ms[20:55]</td><td>19:10</td><td>左(&lt;20:00)</td><td class="yes">✅完整</td><td class="no">⚠️残段(19:10-20:55 头在窗1)</td><td><b>窗1 完整版</b>;窗2 残段丢</td></tr>
+<tr><td class="seg">C [21:00][S03]测试报告明天给[21:30]</td><td>21:00</td><td>右(&gt;20:00)</td><td class="no">❌(超窗1终 21:30)</td><td class="yes">✅完整</td><td><b>窗2</b></td></tr>
+</table>
+
+<div class="note"><b>关键:</b>窗1 切在 21:5(静音处)→ 段 B 在窗1 里是<b>完整</b>的(19:10-20:55 &lt; 21:5)。窗2 也有 B 但是<b>残段</b>(从 18:5 才开始听,缺 18:5 之前的头)→ 被丢,留窗1 完整版。<b>VAD 切静音 = turn 不截断</b>,这是整个方案能干净合并的地基。</div>
+
+<h3>4.3 截断检测(兜底强切)</h3>
+<p>若某段 <code>end</code> 落在某窗 <code>end</code> 的 ε(0.3s)内 → 判为疑似强切截断 → 改留<b>下一窗</b>的完整版。这是无 VAD 命中时的兜底。</p>
+
+<h2>5. 跨窗说话人匹配(核心 <b>①</b>)</h2>
+<p>目标:把每窗本地 <code>[S01]</code> 映射到<b>全局一致 ID</b>。利用<b>重叠区</b>做"同时间同说话人"的对齐证据。</p>
+
+<h3>5.1 每窗提取 speaker embedding</h3>
+<ul>
+<li>按 MOSS 段的 <code>[start][Sxx]text[end]</code> 从音频切出每个说话人的语音段;</li>
+<li>每段过 speaker encoder → embedding;</li>
+<li>按 <code>(窗, 本地标签)</code> 聚合 → <b>加权均值</b>(权重 = 置信度,见 §6)。</li>
+</ul>
+
+<h3>5.2 重叠区 1:1 对应(优先路径)</h3>
+<div class="new">
+在相邻窗 N-1 / N 的重叠区,两窗都有段和说话人。把重叠区<b>按说话人切开</b>:
+<ol>
+<li>对重叠区里两窗各自的 local 说话人,各算 embedding + 置信度;</li>
+<li>尝试 <b>1:1 对应</b>(Hungarian):若每对余弦 ≥ 阈值 → 认为这些 local 说话人<b>就是同一全局说话人</b>(重叠区=同时间,直接对齐,高置信);</li>
+<li><b>若对不上</b>(某对余弦 &lt; 阈值,或人数不等)→ 说明某窗转写/切分有错 → 进入 5.3。</li>
+</ol>
+</div>
+
+<h3>5.3 全局余弦重分配(回退路径)</h3>
+<p>对没对上的 local 说话人,跨<b>全窗</b>算 embedding 余弦,诊断哪部分错了:</p>
+<ul>
+<li>余弦 ≥ 阈值 → 合并到已有全局 ID;</li>
+<li>都低于阈值 → 开新全局 ID;</li>
+<li>冲突(一个 local 对上多个全局 / 多个 local 对上一个全局)→ 取最高余弦,其余开新 ID 或标记待人工复核。</li>
+</ul>
+<div class="note"><b>逻辑:</b>重叠区能对上的直接确认(强证据),对不上的退到全局相似度找错并重分配。这样既利用了重叠的同时间证据,又能诊断哪窗切错了。</div>
+
+<h2>6. 置信度与短段(<b>③</b>)</h2>
+<div class="new">短段 embedding 不可靠,需差异化处理:
+<ul>
+<li>段 <b>&lt; 2s</b> → <b>降低置信度</b>(聚合时降权,不主导该说话人向量);</li>
+<li>段 <b>&lt; 0.5s</b> → <b>直接丢弃</b>,不参与 embedding 聚合;</li>
+<li>置信度 = f(总语音时长, 段数, 平均段长, 自一致性);</li>
+<li>用途:重叠 1:1 是否采信(低置信 → 不采信,走 5.3);聚合权重;冲突时优先高置信。</li>
+</ul>
+</div>
+
+<h2>7. 整体流程</h2>
+<pre>长音频
+  │
+  ├─ silero-vad → 静音 gaps
+  ├─ 切窗(标称锚定 + VAD 头最早/尾最晚 + max_remaining 整段兜底)
+  │     ↓ 每窗 [start, end]
+  ├─ ffmpeg 切 + generate_transcription → 每窗 transcript(local)
+  │     ↓ windows = [{offset, end, transcript}]
+  ├─ merge_windows.merge → 文本+时间戳合并(中点去重 + 截断检测)
+  │     ↓ 全局时间戳文本(说话人仍是 local 标签)
+  ├─ speaker encoder → 每段 embedding(+ 置信度,短段降权/丢)
+  ├─ 重叠区 1:1 对应 → 高置信直接合并;对不上 → 全局余弦重分配
+  │     ↓ 全局说话人 ID
+  └─ 输出 merged.txt(全局时间戳 + 全局说话人)</pre>
+
+<h2>8. 输出</h2>
+<ul>
+<li><code>merged.txt</code>:全局时间戳 + 全局说话人标签的完整转写</li>
+<li><code>windows.json</code>:每窗 offset/end/transcript(调试)</li>
+<li><code>speaker_mapping.json</code>:(窗,本地)→ 全局 ID + 置信度</li>
+</ul>
+
+<h2>9. 边界与限制</h2>
+<ul>
+<li>silero 不可用 → 全程强切(标称±L),截断检测兜底;</li>
+<li>跨窗同说话人音色漂移(疲劳/换麦)可能误并,置信度低的不强合并;</li>
+<li>重叠区 1:1 依赖两窗转写都正确;一窗切错会触发 5.3 回退;</li>
+<li>speaker encoder 须是 speaker-trained(如 ECAPA / pyannote),<b>不能用 Whisper encoder</b>(它编码内容不编码音色)。</li>
+</ul>
+
+</body>
+</html>
