@@ -41,6 +41,7 @@ train = [
   "scipy>=1.11",
   "soundfile>=0.12",
   "soxr>=0.5",
+  "silero-vad",
 ]
 dev = ["pytest"]
 

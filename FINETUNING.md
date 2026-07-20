@@ -167,15 +167,17 @@ For most meeting-domain adaptation, `--loss_window 8192` on a single 80 GB card 
 The model's context is ~128k tokens (~90 min). Audio longer than that **cannot** be fed as one sequence regardless of GPU count -- it is a context-window limit, not a memory limit. Multi-GPU does not help here. You must segment first:
 
 ```bash
-# cut 5h audio + transcripts into <=60-min segments (16 kHz mono, time-shifted)
-python scripts/segment_long.py --input raw.jsonl --segment_minutes 60 \
-  --output raw_seg.jsonl --audio_out data/seg
+# cut 5h audio + transcripts into ~30-min segments at silence boundaries
+# (silero-vad; falls back to rigid cuts if unavailable). Each segment starts
+# at 0.0 with time-shifted transcript.
+python scripts/segment_long.py --input raw.jsonl --segment_minutes 30 \
+  --tolerance_minutes 5 --output raw_seg.jsonl --audio_out data/seg
 # then prepare + train as usual (each segment <= 90 min, fits with --loss_window)
 python prepare_data.py --input_jsonl raw_seg.jsonl --output_dir data --train_split 0.95
 python finetune.py --train_jsonl data/train.jsonl ... --max_length 131072 --loss_window 8192
 ```
 
-Each segment's transcript is time-shifted to start at 0.0. For 5h audio this yields ~5 segments; train each with `--loss_window` (single card) or across cards with DDP (throughput).
+Each segment's transcript is time-shifted to start at 0.0. For 5h audio this yields ~5 segments; train each with `--loss_window` (single card) or across cards with DDP (throughput). VAD cutting at silence avoids truncating speaker turns across window boundaries (rigid cuts can fragment a turn).
 
 ## Notes
 

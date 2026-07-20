@@ -3,16 +3,21 @@
 
 The model's context is ~128k tokens (~90 min). Audio longer than that CANNOT be
 fed as one sequence regardless of GPU count -- it must be segmented. This script
-cuts each (audio, transcript) row into consecutive --segment_minutes windows,
-writing new per-segment audio files (16 kHz mono via ffmpeg) and time-shifted
-transcripts so each segment starts at 0.0.
+cuts each (audio, transcript) row into consecutive windows of ~--segment_minutes,
+preferring to cut at SILENCE (via silero-vad) so speaker turns are not truncated.
+Writes per-segment audio (16 kHz mono via ffmpeg) and time-shifted transcripts
+(each starts at 0.0).
 
 Input JSONL (one per line): {"audio": "path.wav", "transcript": "[0.5][S03]...[...]"}
 Output: a new JSONL where each line is one segment, ready for prepare_data.py.
 
 Usage:
-    python scripts/segment_long.py --input raw.jsonl --segment_minutes 60 --output raw_seg.jsonl --audio_out data/seg
+    python scripts/segment_long.py --input raw.jsonl --segment_minutes 30 \
+        --tolerance_minutes 5 --output raw_seg.jsonl --audio_out data/seg
     python prepare_data.py --input_jsonl raw_seg.jsonl --output_dir data --train_split 0.95
+
+VAD: requires `silero-vad` (pip install silero-vad). If unavailable, the script
+prints a warning and falls back to rigid cuts at exactly --segment_minutes.
 """
 from __future__ import annotations
 
@@ -66,21 +71,83 @@ def cut_audio(src: Path, start: float, duration: float, dest: Path) -> None:
     )
 
 
+def silence_gaps(audio_path: Path, min_gap: float = 0.3):
+    """Return list of (start, end) silence gaps in seconds via silero-vad.
+
+    Returns None if silero-vad is unavailable (caller falls back to rigid cuts).
+    """
+    try:
+        import soundfile as sf
+        import soxr
+        from silero_vad import get_speech_timestamps, load_silero_vad
+    except ImportError:
+        return None
+    wav, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)
+    wav = wav.mean(axis=1)
+    if sr != 16000:
+        wav = soxr.resample(wav, sr, 16000)
+        sr = 16000
+    model = load_silero_vad()
+    ts = get_speech_timestamps(wav, model, return_seconds=True, min_speech_duration_ms=250)
+    gaps = []
+    for i in range(len(ts) - 1):
+        gs, ge = ts[i]["end"], ts[i + 1]["start"]
+        if ge - gs >= min_gap:
+            gaps.append((gs, ge))
+    return gaps
+
+
+def pick_cut(gaps, target: float, tol: float, duration: float, floor: float) -> float:
+    """Pick a silence-gap midpoint nearest `target` within +-tol; else rigid."""
+    if gaps:
+        lo, hi = target - tol, target + tol
+        cands = [((g[0] + g[1]) / 2.0) for g in gaps if lo <= (g[0] + g[1]) / 2.0 <= hi]
+        if cands:
+            return min(cands, key=lambda m: abs(m - target))
+    cut = min(target, duration)
+    return max(cut, floor)
+
+
+def plan_cuts(duration: float, seg_sec: float, tol_sec: float, min_sec: float, gaps):
+    """Return list of (start, end) consecutive segments covering [0, duration]."""
+    cuts = []
+    cursor = 0.0
+    while cursor < duration - min_sec:
+        target = cursor + seg_sec
+        if target >= duration:
+            cuts.append((cursor, duration))
+            return cuts
+        end = pick_cut(gaps, target, tol_sec, duration, cursor + min_sec)
+        if end - cursor < min_sec:  # safety: avoid tiny segments
+            end = min(target, duration)
+        cuts.append((cursor, end))
+        cursor = end
+    if cursor < duration:
+        cuts.append((cursor, duration))
+    return cuts
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="raw.jsonl with {audio, transcript}")
-    ap.add_argument("--segment_minutes", type=float, default=60.0)
+    ap.add_argument("--segment_minutes", type=float, default=30.0)
+    ap.add_argument("--tolerance_minutes", type=float, default=5.0,
+                    help="cut at the silence nearest the target within +-this")
+    ap.add_argument("--min_segment_seconds", type=float, default=10.0)
+    ap.add_argument("--min_gap_seconds", type=float, default=0.3,
+                    help="minimum silence gap length to consider a cut point")
+    ap.add_argument("--no_vad", action="store_true", help="disable VAD, use rigid cuts")
     ap.add_argument("--output", default="raw_seg.jsonl")
     ap.add_argument("--audio_out", default="data/seg")
-    ap.add_argument("--min_segment_seconds", type=float, default=10.0,
-                    help="drop segments shorter than this (tail scraps)")
     args = ap.parse_args()
 
     src = Path(args.input).expanduser().resolve()
     out_jsonl = Path(args.output)
     audio_out = Path(args.audio_out).expanduser().resolve()
     seg_sec = args.segment_minutes * 60.0
+    tol_sec = args.tolerance_minutes * 60.0
     n_written = 0
+    vad_on = not args.no_vad
 
     with out_jsonl.open("w", encoding="utf-8") as w:
         for line_no, line in enumerate(src.read_text(encoding="utf-8").splitlines(), 1):
@@ -99,10 +166,16 @@ def main() -> None:
                 print(f"[line {line_no}] skip, cannot probe {audio}: {exc}")
                 continue
 
-            n_segs = max(1, int((duration + seg_sec - 1) // seg_sec))
-            for i in range(n_segs):
-                start = i * seg_sec
-                end = min((i + 1) * seg_sec, duration)
+            gaps = None
+            if vad_on:
+                gaps = silence_gaps(audio, min_gap=args.min_gap_seconds)
+                if gaps is None:
+                    print(f"[line {line_no}] silero-vad unavailable, falling back to rigid cuts")
+                    gaps = []
+                    vad_on = False  # warn once, then rigid for the rest
+
+            cuts = plan_cuts(duration, seg_sec, tol_sec, args.min_segment_seconds, gaps)
+            for i, (start, end) in enumerate(cuts):
                 if end - start < args.min_segment_seconds:
                     continue
                 dest = audio_out / f"{audio.stem}_seg{i:03d}.wav"
@@ -120,7 +193,7 @@ def main() -> None:
                 ) + "\n")
                 n_written += 1
 
-    print(f"wrote {n_written} segments (<= {args.segment_minutes} min each) to {out_jsonl}")
+    print(f"wrote {n_written} segments to {out_jsonl}")
 
 
 if __name__ == "__main__":
