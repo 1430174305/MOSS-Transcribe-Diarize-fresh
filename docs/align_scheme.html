@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MOSS 长音频说话人对齐方案(三步法)</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;max-width:980px;margin:24px auto;line-height:1.65;color:#1f2328;padding:0 18px}
+  h1{font-size:1.6em;border-bottom:2px solid #2c3e50;padding-bottom:.3em}
+  h2{color:#2c3e50;margin-top:2em;border-left:5px solid #2c3e50;padding-left:.55em}
+  h3{color:#34495e;margin-top:1.4em}
+  table{border-collapse:collapse;width:100%;margin:1em 0;font-size:.95em}
+  th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;vertical-align:top}
+  th{background:#f6f8fa}
+  code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:.92em}
+  pre{background:#f6f8fa;padding:12px 14px;border-radius:6px;overflow-x:auto;font-size:.88em;line-height:1.45}
+  .note{background:#fff8c5;border-left:4px solid #d4a72c;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
+  .core{background:#dafbe1;border-left:4px solid #2da44e;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
+  .warn{background:#ffe5e5;border-left:4px solid #cf222e;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
+  .seg{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em}
+  .step{display:inline-block;width:28px;height:28px;line-height:28px;border-radius:50%;background:#2c3e50;color:#fff;text-align:center;font-weight:bold;margin-right:6px}
+</style>
+</head>
+<body>
+
+<h1>MOSS 长音频说话人对齐方案(三步法)</h1>
+<p>把长音频(超 90min 上下文)的说话人一致化拆成三步,<b>step1/step2 只做信息汇总,所有算法集中在 step3 对齐</b>。本版<b>暂不使用前后两段重叠区的 1:1 对齐逻辑</b>,改走"每窗稳定提取 → 不足重提取 → 全局相似度/聚类"。</p>
+
+<div class="core"><b>总览:</b><br>
+<span class="step">1</span><b>分段转写</b>:长音频切段,每窗跑 MOSS,得到带 local <code>[Sxx]</code> 的转写。<br>
+<span class="step">2</span><b>滑窗提取 embedding</b>:按转写定位每个说话人语音区,滑窗过 speaker encoder,得大量 sub-embedding。<br>
+<span class="step">3</span><b>对齐</b>(核心):稳定提取+去不稳 → 不足/缺失重提取 → 全局相似度/聚类 → 全局说话人 ID。
+</div>
+
+<h2>1. 参数</h2>
+<table>
+<tr><th>参数</th><th>默认</th><th>含义</th></tr>
+<tr><td><code>sub_window_seconds</code></td><td>3.0</td><td>step2 滑窗长度</td></tr>
+<tr><td><code>sub_step_seconds</code></td><td>1.0</td><td>滑窗步长(重叠 2/3)</td></tr>
+<tr><td><code>min_sub_speech_seconds</code></td><td>1.0</td><td>子窗内有效语音 &lt; 此则跳过(不 embed)</td></tr>
+<tr><td><code>stability_threshold</code></td><td>0.7</td><td>step3a:子 embedding 到中位数的余弦 ≥ 此才保留(稳核)</td></tr>
+<tr><td><code>min_stable_count</code></td><td>3</td><td>稳核子 embedding 数 &lt; 此 → 判为"不足",进 3b 重提取</td></tr>
+<tr><td><code>min_stable_speech_seconds</code></td><td>5.0</td><td>稳核总语音 &lt; 此 → 判为"不足"</td></tr>
+<tr><td><code>reextract_min_solo_seconds</code></td><td>3.0</td><td>3b:只用 ≥ 此的"完全包含"独白段重提取</td></tr>
+<tr><td><code>cluster_threshold</code></td><td>0.55</td><td>step3c 聚类余弦阈值(需校准)</td></tr>
+</table>
+
+<h2><span class="step">1</span> Step1 分段转写</h2>
+<p>长音频切成 ≤90min 的窗(VAD 切静音或固定长),每窗独立跑 MOSS 推理。</p>
+<ul>
+<li>每窗输出 <code>[start][Sxx]text[end]</code> 格式,时间戳为<b>窗内 local</b>,说话人标签 <code>[Sxx]</code> 是<b>每窗独立从 S01 重新编号</b>(窗1的 S01 和窗2的 S01 不一定是同一人——这正是 step3 要解决的);</li>
+<li>记录 <code>{offset, transcript}</code>;<code>offset</code> = 窗在全音频里的起始秒,用于还原全局时间戳。</li>
+</ul>
+<p><b>本步只产出信息,不做任何对齐。</b>窗之间是否重叠不影响 step3(本版不用重叠 1:1)。</p>
+
+<h2><span class="step">2</span> Step2 滑窗提取 embedding</h2>
+<p>对每窗,按转写段 <code>[start][Sxx]text[end]</code> 定位每个 local 说话人的语音区间,在区间上<b>滑窗</b>过 speaker encoder。</p>
+<pre>对窗 i 的每个 local 说话人 L:
+  语音区 = {(seg_start, seg_end) | seg.speaker == L}  (该窗 local 时间)
+  for t in seg_starts, step=sub_step:
+      w = [t, t+sub_window]
+      if 该窗内 w 内 L 的有效语音 >= min_sub_speech_seconds:
+          emb = speaker_encoder(audio[ w + offset ])   # 切该窗音频对应区
+          保存 (i, L, t, emb, dur)  # 一个 sub-embedding</pre>
+<div class="note"><b>为什么要滑窗而不是整段一个 embedding:</b>一个说话人在一窗里有多个 sub-embedding → 才能在 step3a 算"稳定性"(段内音色是否一致)、剔除离群(混入他人/噪声的子窗)。整段一个 embedding 无法做稳定性判断。</div>
+<p>encoder 选型:<b>SpeechBrain ECAPA-TDNN</b>(纯 pip,起步推荐)或 <b>pyannote/embedding</b>(WavLM,质量更高)。embedding 归一化到单位长度。<b>不能用 Whisper encoder</b>(编码内容不编码音色)。</p>
+
+<h2><span class="step">3</span> Step3 对齐(核心,所有算法在此)</h2>
+<p>输入:每 (窗 i, local 说话人 L) 的一组 sub-embeddings。输出:(窗, local) → 全局说话人 ID。</p>
+
+<h3>3.1 稳定提取 + 去除不稳定</h3>
+<p>对每个 (i, L):</p>
+<ol>
+<li>算<b>中位数向量</b> <code>m = normalize(median(sub_embs))</code>;</li>
+<li>每个 sub-embedding 的稳定度 <code>s_k = cos(emb_k, m)</code>;</li>
+<li>保留 <code>s_k ≥ stability_threshold</code> 的子 embedding → <b>稳核 (stable core)</b>;</li>
+<li>该说话人的<b>稳定度</b> = 稳核内子 embedding 两两余弦的中位数(高=音色一致、可信;低=混/噪)。</li>
+</ol>
+<div class="warn">被剔除的子 embedding 多半是混入他人 / 突发噪声 / 极短窗,本步把它们清掉,不让它们污染后续聚合。</div>
+
+<h3>3.2 不足 / 缺失的重提取(完全包含的说话人)</h3>
+<p>若 (i, L) 的稳核不满足 <code>count ≥ min_stable_count</code> 且 <code>总稳核语音 ≥ min_stable_speech_seconds</code> → 判为<b>不足</b>,重提取:</p>
+<ol>
+<li>在该窗转写里找 <b>"完全包含"</b>的独白段:该段只有 L 一个说话人、无重叠、段长 ≥ <code>reextract_min_solo_seconds</code>;</li>
+<li>对这些干净独白段<b>重新切音频、重新滑窗 embed</b>(可用更长 sub_window,提升信号);</li>
+<li>再跑一次 3.1 稳定过滤,合并进稳核。</li>
+</ol>
+<div class="note"><b>还不足怎么办:</b>该 (i, L) 仍不足 → 标记为 <b>低置信</b>向量(不作为聚类中心,但可在 3.3 被分配到最近的高置信簇)。极端没数据 → 该 local 标签无法对齐,保留为独立 ID(待人工)。</div>
+<div class="core"><b>要点:</b>先把每窗每个说话人的 embedding 提稳、提全;不稳的删、不够的用干净独白段补。这一步是后面聚类能否正确的前提。</div>
+
+<h3>3.3 全局相似度 / 聚类</h3>
+<p>每个 (i, L) 聚合成<b>一个稳定向量</b> <code>v_{i,L}</code>(稳核的加权均值,权重=稳定度),并带置信度 <code>c_{i,L}</code>(= 稳定度 × 稳核规模因子)。</p>
+<ol>
+<li>算所有 (i, L) 两两余弦 <code>cos(v_a, v_b)</code>;</li>
+<li><b>聚类</b>:以 <code>cos ≥ cluster_threshold</code> 为边建图,取连通分量(或用 agglomerative + 平均链接 + 阈值剪枝)。高置信向量优先作簇锚;</li>
+<li>低置信向量 → 分配到最近的簇(余弦最高者),若都 &lt; 阈值 → 开新簇(独立 ID);</li>
+<li>冲突(多对一)→ 取最高余弦,其余按次高分配或开新簇。</li>
+</ol>
+<p>每个簇 = 一个全局说话人 ID(S01, S02, …)。得到 <code>(窗 i, local L) → 全局 ID</code> 映射。</p>
+
+<h2>4. 整体流程</h2>
+<pre>长音频
+  │
+ ├─ Step1 分段转写:切窗 → MOSS → 每窗 {offset, transcript(local [Sxx])}
+ │
+ ├─ Step2 滑窗提取:按 transcript 定位每 (i,L) 语音区 → 滑窗 speaker encoder
+ │     ↓ 每 (i,L) 一组 sub-embeddings
+ │
+ └─ Step3 对齐(算法集中):
+       ├─ 3.1 稳定提取:中位数 m → 保留 cos(emb,m)≥τ 的稳核,删离群
+       ├─ 3.2 不足重提取:稳核不够 → 找"完全包含"独白段重 embed;还不足→低置信
+       └─ 3.3 全局聚类:v_{i,L}=稳核加权均值 → 两两余弦 → 连通分量聚类 → 全局 ID
+             ↓ (窗,local)→全局ID 映射
+       → 重写 merged.txt:全局时间戳 + 全局说话人</pre>
+
+<h2>5. 输出</h2>
+<ul>
+<li><code>merged.txt</code>:全局时间戳 + 全局说话人标签(S01/S02… 跨窗一致)</li>
+<li><code>embeddings.json</code>:每 (窗,local) 的稳核向量 + 置信度(调试)</li>
+<li><code>speaker_mapping.json</code>:(窗,local)→全局 ID + 置信度 + 稳定度</li>
+<li><code>clusters.json</code>:聚类结果(每簇成员、余弦矩阵)</li>
+</ul>
+
+<h2>6. 与旧方案(重叠 1:1)的差异</h2>
+<table>
+<tr><th>维度</th><th>旧方案(scheme.html)</th><th>本方案</th></tr>
+<tr><td>对齐依据</td><td>重叠区同时间 1:1 对应</td><td>全局 embedding 相似度/聚类</td></tr>
+<tr><td>是否用重叠区</td><td>是,必须有重叠且两窗都转写</td><td><b>不用</b>(暂不考虑重叠 1:1)</td></tr>
+<tr><td>稳定性</td><td>靠重叠同时间证据</td><td>靠滑窗 sub-embedding 稳核过滤</td></tr>
+<tr><td>不足处理</td><td>短段降权</td><td>"完全包含"独白段重提取</td></tr>
+<tr><td>复杂度</td><td>对齐逻辑分散(切窗+重叠+1:1+回退)</td><td>算法集中 step3,step1/2 只汇总</td></tr>
+</table>
+
+<h2>7. 边界与限制</h2>
+<ul>
+<li>聚类阈值 <code>cluster_threshold</code> 需按你的 encoder + 域校准(不同 encoder 余弦尺度不同);</li>
+<li>同一人音色跨窗漂移(疲劳/换麦)可能被聚成两簇 → 阈值偏松会合并不同人,偏紧会拆同一人,需权衡;</li>
+<li>转写里说话人标签错误(MOSS 把两人合一/一人拆二)会污染该窗 embedding,3.1 的稳核过滤能挡一部分;</li>
+<li>本版不用重叠 1:1,实现简单,但放弃了"同时间强证据";若后续聚类效果不够,可再叠加重叠 1:1 作约束。</li>
+</ul>
+
+</body>
+</html>
