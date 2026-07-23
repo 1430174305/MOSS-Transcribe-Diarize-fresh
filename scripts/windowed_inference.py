@@ -62,9 +62,43 @@ def pick_tail(gaps, nominal_end: float, L: float) -> float:
     return hi  # rigid
 
 
-def plan_windows(duration, T, L, max_remaining, min_seg, gaps):
-    """Return [(start, end), ...] with absolute nominal anchors, no drift."""
+def pick_nearest(gaps, target: float, L: float) -> float:
+    """VAD silence nearest `target` within [target-L, target+L]; rigid target.
+
+    Used for back-to-back (no-overlap) cutting: cut at the silence closest to
+    the nominal end, next window starts exactly there (no overlap).
+    """
+    lo, hi = target - L, target + L
+    mids = [m for m in _gap_midpoints(gaps) if lo <= m <= hi]
+    if mids:
+        return min(mids, key=lambda m: abs(m - target))
+    return target  # rigid
+
+
+def plan_windows(duration, T, L, max_remaining, min_seg, gaps, no_overlap=False):
+    """Return [(start, end), ...].
+
+    - overlap mode (default, for old same-time 1:1 scheme): absolute nominal
+      anchors, head earliest / tail latest, ~2L overlap between windows.
+    - no_overlap mode (for montage-voting scheme): back-to-back, each window
+      ends at the VAD silence nearest (start + T), next starts exactly there.
+    """
     windows = []
+    if no_overlap:
+        cursor = 0.0
+        while cursor < duration:
+            start = cursor
+            if duration - start <= max_remaining:
+                windows.append((start, duration))
+                break
+            end = pick_nearest(gaps, start + T, L)
+            if end >= duration or end - start < min_seg:
+                windows.append((start, duration))
+                break
+            windows.append((start, end))
+            cursor = end
+        return windows
+
     N = 0
     while True:
         nominal_start = N * T
@@ -109,6 +143,8 @@ def main() -> None:
     ap.add_argument("--min_segment_seconds", type=float, default=10.0)
     ap.add_argument("--max_new_tokens", type=int, default=65536)
     ap.add_argument("--max_length", type=int, default=131072)
+    ap.add_argument("--no_overlap", action="store_true",
+                    help="back-to-back cuts at VAD silence (for montage-voting scheme; default overlaps for old 1:1)")
     ap.add_argument("--dtype", default="auto")
     args = ap.parse_args()
 
@@ -138,7 +174,7 @@ def main() -> None:
     else:
         print(f"[info] {len(gaps)} silence gaps (>= {args.min_gap_seconds}s) found")
 
-    windows = plan_windows(duration, T, L, max_rem, min_seg, gaps)
+    windows = plan_windows(duration, T, L, max_rem, min_seg, gaps, no_overlap=args.no_overlap)
     print(f"[info] planned {len(windows)} windows for {duration:.1f}s audio")
 
     # per-window inference
