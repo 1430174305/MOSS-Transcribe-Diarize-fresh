@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MOSS 长音频说话人匹配 — 高质量样本平滑拼接 montage 方案</title>
+<title>MOSS 长音频说话人匹配 — 多随机 montage 投票方案</title>
 <style>
   *{box-sizing:border-box}
   body{font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;max-width:980px;margin:24px auto;line-height:1.65;color:#1f2328;padding:0 18px}
@@ -23,105 +23,123 @@
 </head>
 <body>
 
-<h1>MOSS 长音频说话人匹配 — 高质量样本平滑拼接 montage 方案</h1>
-<p>不用 speaker encoder + 聚类,改用 <b>MOSS 自身的 diarization</b> 做跨窗匹配:对每相邻窗,从每个 (窗, local) 说话人选<b>少量高质量语音块</b>,<b>平滑拼接</b>成 montage 塞进一个 ≤90min 上下文,过一遍 MOSS → 同上下文内同人自动同标签 → 按"块来自哪个 (窗, local)"恢复全局映射。本方案的核心是"<b>高质量块</b>"的严格定义,直接规避污染块与非自然输入两个风险。</p>
+<h1>MOSS 长音频说话人匹配 — 多随机 montage 投票方案</h1>
+<p>不用 speaker encoder、不用聚类阈值。对每相邻窗,生成<b>多个随机 montage</b>(随机片段 + 随机顺序 + 平滑拼接),每个过一遍 MOSS,统计<b>谁和谁被 MOSS 判同标签的次数最多</b> → 多数投票定跨窗对应。<b>随机化把单次拼接的顺序/噪声平均掉,匹配频次本身就是置信度</b>。</p>
 
 <div class="core"><b>三步:</b><br>
 <span class="step">1</span><b>分段转写</b>:切窗 → MOSS → 每窗 local <code>[Sxx]</code> 转写。<br>
-<span class="step">2</span><b>选高质量块 + 平滑拼接</b>:按转写定位每说话人语音,过质量门控选 2-4 块,crossfade + 静音间隔拼成 montage。<br>
-<span class="step">3</span><b>重跑 MOSS + 恢复映射</b>:montage 过 MOSS → 每块标签 = 该 (窗, local) 的全局 ID。
+<span class="step">2</span><b>片段池 + 随机 montage</b>:按转写切每说话人语音段(过质量门),随机抽片段、随机顺序、平滑拼接成 K 个小 montage。<br>
+<span class="step">3</span><b>批量重跑 MOSS + 投票</b>:每 montage 得同标签关系,统计每对 (窗N-1 spk, 窗N spk) 的<b>同标签频次</b> → 频次最高且显著 → 最终对应。
 </div>
 
 <h2>1. 参数</h2>
 <table>
 <tr><th>参数</th><th>默认</th><th>含义</th></tr>
-<tr><td><code>block_min_seconds</code></td><td>3.0</td><td>高质量块最短(够 MOSS 识别音色)</td></tr>
-<tr><td><code>block_max_seconds</code></td><td>10.0</td><td>单块上限(避免一人占满 montage)</td></tr>
-<tr><td><code>blocks_per_speaker</code></td><td>3</td><td>每 (窗,local) 说话人取多少块(代表性 vs montage 体积)</td></tr>
-<tr><td><code>min_snr_db</code></td><td>20.0</td><td>块 SNR 下限(可降到 15)</td></tr>
-<tr><td><code>min_voiced_ratio</code></td><td>0.8</td><td>块内实际语音占比下限</td></tr>
-<tr><td><code>max_overlap_ratio</code></td><td>0.0</td><td>块与他人时段重叠占比上限(<b>0=纯单说话人</b>)</td></tr>
-<tr><td><code>crossfade_ms</code></td><td>60</td><td>块边界 crossfade,消 click</td></tr>
-<tr><td><code>inter_block_silence_ms</code></td><td>300</td><td>块间静音间隔,给 MOSS 清晰说话人边界</td></tr>
-<tr><td><code>loudness_target_dbfs</code></td><td>-23.0</td><td>块响度归一目标(轻度,不重压缩)</td></tr>
-<tr><td><code>montage_max_minutes</code></td><td>85</td><td>montage 总时长上限(留余量 &lt;90min 上下文)</td></tr>
+<tr><td><code>K_montages</code></td><td>12</td><td>每对窗生成的随机 montage 数(自适应,见 §6)</td></tr>
+<tr><td><code>frags_per_speaker_per_montage</code></td><td>1-2</td><td>每 montage 每说话人抽几段(少=montage 小=跑得快)</td></tr>
+<tr><td><code>frag_min_seconds</code></td><td>3.0</td><td>片段最短(MOSS 认音色下限)</td></tr>
+<tr><td><code>frag_max_seconds</code></td><td>8.0</td><td>片段上限</td></tr>
+<tr><td><code>min_snr_db</code></td><td>15.0</td><td>片段 SNR 下限(质量门,可调)</td></tr>
+<tr><td><code>max_overlap_ratio</code></td><td>0.0</td><td>片段与他人时段重叠占比上限(<b>0=纯单说话人</b>)</td></tr>
+<tr><td><code>crossfade_ms</code></td><td>60</td><td>拼接 crossfade,消 click</td></tr>
+<tr><td><code>inter_block_silence_ms</code></td><td>300</td><td>块间静音,给 MOSS 清晰说话人边界</td></tr>
+<tr><td><code>tau_match</code></td><td>0.6</td><td>同标签频次 ≥ 此 + 显著领先 → 采信为同人</td></tr>
+<tr><td><code>margin</code></td><td>0.2</td><td>最高 vs 次高频次的领先幅度下限</td></tr>
 </table>
 
-<h2>2. 高质量块的定义(核心)</h2>
-<p>对每个候选块 b(某说话人 L 在窗 i 内的一段连续语音 <code>[t1, t2]</code>),用<b>硬门控</b>(全过才收,任一不过则弃):</p>
+<h2><span class="step">1</span> Step1 分段转写</h2>
+<p>长音频切 ≤90min 窗,每窗跑 MOSS → <code>{offset, transcript(local [Sxx])}</code>。本步只产出信息,不做匹配。</p>
+
+<h2><span class="step">2</span> Step2 片段池 + 随机 montage</h2>
+
+<h3>2.1 建片段池(带质量门,推荐)</h3>
+<p>对每 (窗 i, local 说话人 L),按转写 <code>[start][Sxx]text[end]</code> 切候选片段,过质量门入库:</p>
 <table>
-<tr><th>维度</th><th>怎么测</th><th>门槛</th><th>为什么</th></tr>
-<tr><td><b>单说话人(最关键)</b></td><td>按转写时间戳查 <code>[t1,t2]</code> 内是否有<b>其他</b>说话人段重叠</td><td>重叠占比 ≤ <code>max_overlap_ratio</code>(默认 <b>0</b>)</td><td>重叠=混合音,污染该说话人音色,是 montage 头号失败源</td></tr>
-<tr><td>时长</td><td>块长 t2−t1</td><td><code>block_min..block_max</code>(3-10s)</td><td>太短 MOSS 认不准音色;太长一人占满 montage</td></tr>
-<tr><td>SNR</td><td>语音帧 RMS / 噪声底 RMS(噪声底取全段静音分位)</td><td>≥ <code>min_snr_db</code>(20,可放宽 15)</td><td>低噪块音色被噪声盖,MOSS 易误判</td></tr>
-<tr><td>语音占比</td><td>VAD voiced 时长 / 块长</td><td>≥ <code>min_voiced_ratio</code>(0.8)</td><td>块里大半是静音/停顿,有效信息不够</td></tr>
-<tr><td>无削波</td><td>峰值 |sample|</td><td>&lt; 0.99</td><td>削波失真污染音色</td></tr>
-<tr><td>带宽</td><td>采样率</td><td>16k(切窗时已保证)</td><td>窄带(电话 8k)音色信息少</td></tr>
+<tr><th>维度</th><th>门槛</th><th>为什么</th></tr>
+<tr><td><b>单说话人</b></td><td>重叠占比 = 0(按转写时间戳,该片段时段无其他说话人)</td><td>重叠=混合音,污染 MOSS 判同</td></tr>
+<tr><td>时长</td><td>3-8s</td><td>太短认不准,太长占满 montage</td></tr>
+<tr><td>SNR</td><td>≥15 dB</td><td>低噪音色被盖</td></tr>
+<tr><td>无削波</td><td>|peak|&lt;0.99</td><td>失真污染</td></tr>
 </table>
-<div class="warn"><b>"单说话人"是重中之重</b>:用转写时间戳做硬过滤——块 <code>[t1,t2]</code> 内只要任何其他说话人段与之时间相交,就判为不纯,直接弃。这把"重叠语音切成混合块"这个最大污染源从源头掐掉。</div>
+<div class="note">质量门是<b>推荐</b>不是必须:不上质量门也能跑(纯随机抽原始片段),但每跑 MOSS 噪声大、投票收敛慢。上了质量门,每跑更干净,K 可以更小。</div>
 
-<p><b>选块策略</b>:每 (窗, local) 说话人按 SNR 降序取 <code>blocks_per_speaker</code>(默认 3)个高质量块;若该说话人高质量块 &lt; 1 → 标记<b>无法 montage 匹配</b>(回退到 embedding 或留独立 ID)。</p>
+<h3>2.2 生成 K 个随机 montage</h3>
+<pre>对 k in 1..K:
+  对每 (窗, local) 说话人:从其片段池随机抽 frags_per_speaker_per_montage 段
+  把所有抽中的片段<b>随机打乱顺序</b>(同人片段不连排)
+  平滑拼接:块间 300ms 静音 + 60ms crossfade + 轻响度归一
+  → montage_k (记录每块来自哪个 (窗, local))</pre>
+<div class="core"><b>关键:</b>每 montage 体积小(每说话人 1-2 段 × 段长 3-8s → 几十秒级)→ 单次 MOSS 推理快;K 个并行/串行都跑得起。随机打乱顺序消除"位置偏置"(MOSS 可能把靠前的习惯性标 S01)。</div>
 
-<h2>3. 平滑拼接</h2>
-<p>把选出的块按 <code>(窗, local, 块序号)</code> 顺序拼成 montage,避免硬接产生 click / 让 MOSS 看清说话人边界:</p>
+<h2><span class="step">3</span> Step3 批量重跑 MOSS + 投票(核心)</h2>
+
+<h3>3.1 单个 montage 的同标签关系</h3>
+<p>montage_k 过 MOSS → 转写带 <code>[Sxx]</code>。按构造记录把每块映射回 (窗, local):该块时段内 MOSS 标签的<b>众数</b> = 该 (窗, local) 在本 montage 的标签。于是本 montage 给出一组"<b>同标签 = 同人</b>"的等价类。</p>
+
+<h3>3.2 同标签频次统计</h3>
+<p>对每个候选对 <code>(a_i, b_j)</code>(a_i = 窗N-1 说话人,b_j = 窗N 说话人):</p>
+<pre>出现在一起的次数    n_ij = #{k | a_i 与 b_j 都出现在 montage_k}
+被判同标签的次数    m_ij = #{k | a_i 与 b_j 都出现 且 二者同标签}
+同标签频次          f_ij = m_ij / n_ij      # 条件频次(给定都出现)</pre>
+<div class="warn"><b>必须用条件频次 f_ij = m_ij/n_ij</b>,不能直接用 m_ij——否则"常出现的说话人"虚假占优。n_ij=0(从没一起出现)的对 → 无信号,跳过。</div>
+
+<h3>3.3 投票决策</h3>
+<p>对每个 a_i,看所有 b_j 的 f_ij:</p>
 <ul>
-<li><b>块间静音</b>:插 <code>inter_block_silence_ms</code>(300ms)静音 → MOSS 能清晰切分"这是一段、下一段是另一人",标签更稳;</li>
-<li><b>crossfade</b>:块首尾各 <code>crossfade_ms</code>(60ms)做 cosine fade-in/out 与相邻静音/块交叠 → 消除拼接 click(硬切的高频瞬态会让 MOSS 误判);</li>
-<li><b>响度归一</b>:每块 RMS 对齐到 <code>loudness_target_dbfs</code>(-23 dBFS)<b>轻度</b>归一,避免某说话人过小被淹没;<b>不重压缩/不动态范围</b>(MOSS 训练在自然电平上);</li>
-<li><b>块顺序</b>:同 (窗, local) 的多块<b>分散</b>排(不要把一个说话人的 3 块连排,避免 MOSS 把"连排"当成一个超长 turn);不同窗交错排,让同人块在不同位置出现,利于 MOSS 一致识别。</li>
+<li>取 <code>b* = argmax_j f_ij</code>;</li>
+<li><b>采信条件</b>:<code>f_{i,b*} ≥ tau_match</code> <b>且</b> <code>f_{i,b*} − 次高 ≥ margin</code> → 判 a_i ↔ b* 同人;</li>
+<li>不满足 → a_i 歧义,标记待人工/回退(见 §6)。</li>
 </ul>
-<div class="note"><b>体积控制</b>:块数 = Σ(每说话人 blocks_per_speaker)。若两窗说话人多到 montage 超 <code>montage_max_minutes</code>,按"每说话人减到 2 块 → 1 块"递减排采样,仍超则该对窗回退 embedding。</div>
+<p>跨所有 a_i 汇总 → <code>(窗N-1 local) ↔ (窗N local)</code> 对应 → 链式传递得全局 ID。</p>
 
-<h2>4. 重跑 MOSS + 恢复映射</h2>
-<ol>
-<li>montage 过一遍 MOSS(<code>do_sample=False, max_new_tokens</code> 给足),得 montage 转写 <code>[t][Sxx]text[/t]</code>;</li>
-<li><b>按块查标签</b>:montage 构造时记录每块 <code>(window, local, t_start_in_montage, t_end_in_montage)</code>;取该块时段内 MOSS 标签的<b>众数</b> → 即该 (窗, local) 的全局 ID;(若一块被 MOSS 切成多段,取众数;若一块里出现两个标签,该块语音不纯,丢弃此块、该 (窗,local) 用其他块)</li>
-<li>跨窗同一全局 ID 的 (窗, local) 即为同人 → 得 <code>(窗, local) → 全局 ID</code> 映射;</li>
-<li>重写 merged.txt:全局时间戳 + 全局说话人。</li>
-</ol>
+<h2>4. 自适应 K 与可靠性诊断(投票的额外红利)</h2>
+<div class="core">
+<b>自适应 K:</b>先跑 K0=8;若所有 a_i 的 top 频次都满足采信条件 → 提前停;否则补跑(翻倍 K)到 K_max(如 32)或信号收敛。
+</div>
+<div class="core">
+<b>可靠性诊断:</b>若 M 个说话人/窗,纯随机同标签的概率 ≈ 1/M。若所有对的 <code>max f_ij &lt; 诊断线</code>(如 M=4 时 &lt;0.4)→ 说明 <b>MOSS 在 montage 上根本不一致</b>(拼接输入退化)→ <b>整条 montage 路线不可用,回退 embedding</b>。投票天然给出"这路能不能走"的信号。
+</div>
 
 <h2>5. 整体流程</h2>
 <pre>长音频
   │
  ├─ Step1 分段转写:切窗 → MOSS → 每窗 {offset, transcript(local [Sxx])}
-  │
- ├─ Step2 高质量选块 + 平滑拼接(对每相邻窗对 N-1/N):
-  │     ├─ 按转写定位每 (窗,local) 语音段
-  │     ├─ 硬门控筛高质量块(单说话人=0 重叠 / 3-10s / SNR≥20 / voiced≥0.8)
-  │     ├─ 每说话人取 blocks_per_speaker 块(按 SNR 降序)
-  │     └─ crossfade + 300ms 静音 + 轻响度归一 → montage(≤85min)
-  │
- └─ Step3 重跑 MOSS + 恢复:
-       ├─ montage 过 MOSS → 每块时段标签众数 = 该(窗,local)全局ID
-       ├─ 同全局ID 的 (窗,local) = 同人
-       └─ 重写 merged.txt(全局时间戳 + 全局说话人)</pre>
+ │
+ ├─ Step2 片段池 + 随机 montage:
+ │     ├─ 按 transcript 切每说话人片段,过质量门(单说话人=0重叠/SNR≥15/3-8s)
+ │     └─ for k in 1..K: 随机抽片段 + 随机打乱顺序 + 平滑拼接 → montage_k
+ │
+ └─ Step3 批量重跑 MOSS + 投票:
+       ├─ 每 montage_k 过 MOSS → 块标签众数 → 同标签等价类
+       ├─ 统计每对 (a_i,b_j): f_ij = 同标签次数 / 一起出现次数
+       ├─ 决策:argmax f_ij,且 ≥tau_match + 领先 ≥margin → 同人
+       ├─ 自适应:不够清晰补跑 K;全低 → 诊断 montage 不可用,回退 embedding
+       └─ 链式传递 → 全局 ID → 重写 merged.txt</pre>
 
 <h2>6. 输出</h2>
 <ul>
-<li><code>merged.txt</code>:全局时间戳 + 全局说话人标签</li>
-<li><code>montages/</code>:每对窗的 montage wav + 构造清单(块→(窗,local)映射,调试)</li>
-<li><code>montage_transcripts/</code>:每 montage 的 MOSS 转写</li>
-<li><code>speaker_mapping.json</code>:(窗,local)→全局ID + 该 (窗,local) 用了哪些块</li>
+<li><code>merged.txt</code>:全局时间戳 + 全局说话人</li>
+<li><code>vote_matrix.json</code>:每对 (a_i,b_j) 的 n_ij/m_ij/f_ij(调试,看投票分布)</li>
+<li><code>montages/</code>:各 montage wav + 构造清单(块→(窗,local))</li>
+<li><code>speaker_mapping.json</code>:(窗,local)→全局ID + 置信度(=f_ij × 领先幅度)</li>
 </ul>
 
-<h2>7. 与 embedding/聚类方案对比</h2>
+<h2>7. 为什么这版最稳</h2>
 <table>
-<tr><th>维度</th><th>本方案(高质量 montage 重跑 MOSS)</th><th>embedding + 聚类</th></tr>
-<tr><td>匹配主体</td><td>MOSS 自身 diarization(SOTA)</td><td>外部 speaker encoder</td></tr>
-<tr><td>外部依赖</td><td>无</td><td>ECAPA / pyannote</td></tr>
-<tr><td>阈值调参</td><td>仅质量门(SNR/时长等,物理量好定)</td><td>聚类阈值(需校准,encoder 相关)</td></tr>
-<tr><td>重叠语音</td><td>硬门控剔除(不纯块不入 montage)</td><td>混合 embedding 污染(事后难剔)</td></tr>
-<tr><td>非自然输入风险</td><td>有(拼接独白)→ 用静音间隔+分散排序缓解</td><td>无(只比音色,不在乎结构)</td></tr>
-<tr><td>算力</td><td>每对窗额外 1 次 MOSS(~2x)</td><td>1x 推理 + 廉价 encoder</td></tr>
-<tr><td>质量上限</td><td>高(= MOSS diarization)</td><td>取决于 encoder + 阈值</td></tr>
+<tr><th>风险</th><th>单次 montage</th><th>本版(多随机+投票)</th></tr>
+<tr><td>MOSS 单次拼接不稳定</td><td>直接错</td><td>多次随机平均,错判被多数淹没</td></tr>
+<tr><td>顺序/位置偏置</td><td>有(靠前的易标 S01)</td><td>随机打乱顺序,偏置平均为 0</td></tr>
+<tr><td>低质片段污染</td><td>该次直接错</td><td>该次的错判不占多数;+质量门进一步降</td></tr>
+<tr><td>置信度</td><td>无(只有 0/1)</td><td>f_ij 天然是置信度,可设门</td></tr>
+<tr><td>路线是否可用</td><td>不知道</td><td>全低频次 = 自带诊断信号</td></tr>
 </table>
 
-<h2>8. 限制与边界</h2>
+<h2>8. 限制</h2>
 <ul>
-<li><b>必须实测 MOSS 在拼接 montage 上是否还稳</b>:即便加了静音间隔 + 分散排序,拼接独白仍非自然对话,MOSS 可能在边界处标签抖动 → 块标签众数法能挡一部分;若大面积抖动则该方案不可用,回退 embedding;</li>
-<li><b>相邻窗合并 ≤90min 时不必 montage</b>:直接把两窗音频拼起来跑一次 MOSS 更省(一个 call 内标签一致);montage 价值在于两窗各自接近 90min、合并超限,但"只取高质量语音块"去静音后能塞进 90min;</li>
-<li><b>纯重叠/极噪说话人无高质量块</b>→ 无法 montage 匹配,回退 embedding 或留独立 ID;</li>
-<li><b>跨多窗</b>:逐对窗做 montage 链式传递(1↔2→2↔3→…),或对"全局种子说话人"建一次 montage(用首窗说话人作锚,后续每窗与之 montage)。</li>
+<li><b>算力</b>:K 次 MOSS 推理/对窗。但每 montage 小(几十秒),单次快;K=12 可接受。K_max 上限防爆炸;</li>
+<li><b>条件频次前提</b>:a_i 与 b_j 要在足够多 montage 里<b>同时出现</b>(n_ij 够大)才稳;片段池小的说话人 n_ij 低 → 该对信号弱,可强制安排它俩同现;</li>
+<li><b>MOSS 标签抖动</b>:即便同人,MOSS 也可能在一块里给俩标签 → 用众数挡;大面积抖动 → §4 诊断触发回退;</li>
+<li><b>跨多窗</b>:逐对链式(1↔2→2↔3…);链式误差累积,可在关键对提高 K。</li>
 </ul>
 
 </body>
