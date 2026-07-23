@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MOSS 长音频说话人匹配方案(三步法)</title>
+<title>MOSS 长音频说话人对应关系求解方案</title>
 <style>
   *{box-sizing:border-box}
   body{font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;max-width:980px;margin:24px auto;line-height:1.65;color:#1f2328;padding:0 18px}
@@ -14,7 +14,7 @@
   th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;vertical-align:top}
   th{background:#f6f8fa}
   code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:.92em}
-  pre{background:#f6f8fa;padding:12px 14px;border-radius:6px;overflow-x:auto;font-size:.88em;line-height:1.45}
+  pre{background:#f6f8fa;padding:12px 14px;border-radius:6px;overflow-x:auto;font-size:.85em;line-height:1.45}
   .note{background:#fff8c5;border-left:4px solid #d4a72c;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
   .core{background:#dafbe1;border-left:4px solid #2da44e;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
   .warn{background:#ffe5e5;border-left:4px solid #cf222e;padding:8px 12px;margin:1em 0;border-radius:0 4px 4px 0}
@@ -23,13 +23,13 @@
 </head>
 <body>
 
-<h1>MOSS 长音频说话人匹配方案(三步法)</h1>
-<p>把长音频(超 90min 上下文)的说话人一致化拆成三步:<b>step1/step2 只做信息汇总,所有算法集中在 step3 的匹配逻辑</b>。本版<b>暂不使用前后两段重叠区的 1:1 对齐</b>,改走"稳健原型 → 分层匹配"。</p>
+<h1>MOSS 长音频说话人对应关系求解方案</h1>
+<p>把长音频(超 90min 上下文)的跨窗说话人一致化拆成三步,<b>step1/step2 只汇总信息,所有算法集中在 step3 的对应关系求解</b>。本版不用前后两段重叠区的 1:1 对齐,改走"<b>生成式匹配概率 → 最小违例对应优化 → 变分 E-M 精修 → 最优传输仲裁</b>"的有数学骨架的求解。</p>
 
 <div class="core"><b>总览:</b><br>
-<span class="step">1</span><b>分段转写</b>:长音频切段,每窗跑 MOSS,得到带 local <code>[Sxx]</code> 的转写。<br>
-<span class="step">2</span><b>滑窗提取 embedding</b>:按转写定位每说话人语音区,滑窗过 speaker encoder,得大量 sub-embedding。<br>
-<span class="step">3</span><b>说话人匹配</b>(核心):稳健原型 → 不足重提取 → <b>亲和图 + 分层匹配(种子锚定 → 互最近邻 → 残留分配 → 冲突最优求解)</b> → 全局说话人 ID。
+<span class="step">1</span><b>分段转写</b>:切窗 → MOSS → 每窗带 local <code>[Sxx]</code> 转写。<br>
+<span class="step">2</span><b>滑窗提取 embedding</b>:按转写定位每说话人语音区,滑窗过 speaker encoder → 每 (窗,local) 一组 sub-embedding。<br>
+<span class="step">3</span><b>对应关系求解</b>(核心):稳健原型 → 不足重提取 → <b>生成式匹配概率 → 最小违例分割(correlation clustering)→ 变分 E-M → 最优传输仲裁</b> → 全局说话人 ID。
 </div>
 
 <h2>1. 参数</h2>
@@ -38,124 +38,143 @@
 <tr><td><code>sub_window_seconds</code></td><td>3.0</td><td>step2 滑窗长度</td></tr>
 <tr><td><code>sub_step_seconds</code></td><td>1.0</td><td>滑窗步长</td></tr>
 <tr><td><code>min_sub_speech_seconds</code></td><td>1.0</td><td>子窗有效语音 &lt; 此则跳过</td></tr>
-<tr><td><code>stability_threshold</code></td><td>0.7</td><td>3.1 稳核过滤:子向量到原型余弦 ≥ 此才留</td></tr>
-<tr><td><code>min_stable_count</code></td><td>3</td><td>稳核子向量数 &lt; 此 → 判不足,进 3.2</td></tr>
-<tr><td><code>min_stable_speech_seconds</td><td>5.0</td><td>稳核总语音 &lt; 此 → 判不足</td></tr>
+<tr><td><code>stability_threshold</code></td><td>0.7</td><td>3.1 稳核过滤:子向量到原型亲和 ≥ 此才留</td></tr>
+<tr><td><code>min_stable_count</code></td><td>3</td><td>稳核子向量数 &lt; 此 → 判不足</td></tr>
+<tr><td><code>min_stable_speech_seconds</code></td><td>5.0</td><td>稳核总语音 &lt; 此 → 判不足</td></tr>
 <tr><td><code>reextract_min_solo_seconds</code></td><td>3.0</td><td>3.2 只用 ≥ 此的"完全包含"独白段重提取</td></tr>
-<tr><td><code>tau_spawn</code></td><td>0.45</td><td>3.3 种子区分门:候选种子与已有种子最大亲和 &lt; 此 → 立为新说话人锚</td></tr>
-<tr><td><code>tau_match</code></td><td>0.60</td><td>3.3 互最近邻匹配门:互为最近且亲和 ≥ 此 → 建同说话人边</td></tr>
-<tr><td><code>tau_assign</code></td><td>0.50</td><td>3.3 残留分配门:实体到种子亲和 ≥ 此才可分配,否则自成新说话人</td></tr>
+<tr><td><code>Sigma_within</code></td><td>auto</td><td>同人语音变异协方差(由稳核内散度估计,或用预训练值)</td></tr>
+<tr><td><code>Sigma_between</code></td><td>auto</td><td>异人协方差(由全体原型间散度估计)</td></tr>
+<tr><td><code>prior_same</code></td><td>0.2</td><td>两实体同人先验(底率,影响生成式后验)</td></tr>
+<tr><td><code>em_iterations</code></td><td>5</td><td>3.5 变分 E-M 迭代轮数</td></tr>
+<tr><td><code>solver</code></td><td>pivot</td><td>3.4 求解器:<code>pivot</code>(近似 O(n²))或 <code>ilp</code>(精确,实体≤~50 时)</td></tr>
 </table>
 
 <h2><span class="step">1</span> Step1 分段转写</h2>
-<p>长音频切成 ≤90min 的窗(VAD 切静音或固定长),每窗独立跑 MOSS 推理。</p>
+<p>长音频切成 ≤90min 的窗(VAD 切静音或固定长),每窗独立跑 MOSS。</p>
 <ul>
-<li>每窗输出 <code>[start][Sxx]text[end]</code>,时间戳为<b>窗内 local</b>,说话人标签 <code>[Sxx]</code> 每窗独立从 S01 重新编号(窗1的 S01 与窗2的 S01 不一定是同一人——这是 step3 要解决的<b>对应问题</b>);</li>
-<li>记录 <code>{offset, transcript}</code>;<code>offset</code> 用于还原全局时间戳。</li>
+<li>每窗输出 <code>[start][Sxx]text[end]</code>,时间戳为窗内 local,说话人标签 <code>[Sxx]</code> 每窗独立从 S01 重新编号(跨窗不保证同人);</li>
+<li>记录 <code>{offset, transcript}</code>;<code>offset</code> 还原全局时间戳。</li>
 </ul>
-<p><b>本步只产出信息,不做任何匹配。</b>窗是否重叠不影响 step3(本版不用重叠 1:1)。</p>
+<p><b>本步只产出信息,不做任何对应关系求解。</b>窗是否重叠不影响 step3。</p>
 
 <h2><span class="step">2</span> Step2 滑窗提取 embedding</h2>
-<p>对每窗,按转写段定位每个 local 说话人的语音区间,在区间上滑窗过 speaker encoder。</p>
+<p>对每窗,按转写段定位每个 local 说话人语音区间,在区间上滑窗过 speaker encoder。</p>
 <pre>对窗 i 的每个 local 说话人 L:
   语音区 = {(seg_start, seg_end) | seg.speaker == L}
   for t in seg_starts, step=sub_step:
       w = [t, t+sub_window]
       if w 内 L 的有效语音 >= min_sub_speech_seconds:
           emb = speaker_encoder(audio[ w + offset ])   # 归一化
-          存 (i, L, t, emb, dur)  # 一个 sub-embedding</pre>
-<div class="note"><b>为什么滑窗而非整段一个 embedding:</b>一个说话人在一窗里产生多个 sub-embedding,才能在 3.1 做<b>稳健化</b>(剔离群、判紧凑)。整段一个向量无法判稳。</div>
-<p>encoder 选型:<b>SpeechBrain ECAPA-TDNN</b>(纯 pip,起步)或 <b>pyannote/embedding</b>(WavLM,质量更高),均归一化。<b>不能用 Whisper encoder</b>。</p>
+          存 (i, L, t, emb, dur)</pre>
+<p>encoder:<b>SpeechBrain ECAPA-TDNN</b>(起步)或 <b>pyannote/embedding</b>(WavLM),均归一化。<b>不能用 Whisper encoder</b>。滑窗目的是给 3.1 提供冗余样本以做稳健估计。</p>
 
-<h2><span class="step">3</span> Step3 说话人匹配(核心,所有算法在此)</h2>
-<p>输入:每实体 <code>e = (窗 i, local L)</code> 的一组 sub-embeddings。输出:<code>e → 全局说话人 ID</code>。把"哪些实体是同一人"建模为<b>亲和图上的分层匹配</b>。</p>
+<h2><span class="step">3</span> Step3 对应关系求解(核心,所有算法在此)</h2>
+<p>输入:每实体 <code>e = (窗 i, local L)</code> 的一组 sub-embeddings。输出:<code>e → 全局说话人 ID</code>。把"哪些实体同人"建模为<b>带概率边的图分割优化问题</b>。</p>
 
-<h3>3.1 稳健原型 (Robust Prototype)</h3>
-<p>对每实体 e,把 sub-embeddings 蒸成一个稳健原型 <code>p_e</code> + 置信度 <code>c_e</code>:</p>
+<h3>3.1 稳健原型 (Robust Prototype) — M-估计</h3>
+<p>对每实体 e,把 sub-embeddings 蒸成稳健原型 <code>p_e</code> + 置信度 <code>c_e</code>:</p>
 <ol>
-<li><b>迭代重加权 medoid</b>:以均值 m 为参照,按余弦亲和给子向量赋权(亲和高→权大,离群→权小),重算 m,迭代收敛 → 原型 <code>p_e</code>;</li>
-<li><b>稳核过滤</b>:剔除 <code>cos(emb_k, p_e) &lt; stability_threshold</code> 的离群(混人/噪声子窗),剩稳核;</li>
-<li><b>稳健度</b> <code>ρ_e = 稳核内子向量到 p_e 的平均亲和</code>(高=音色紧凑可信);</li>
-<li><b>置信度</b> <code>c_e = g(ρ_e, 稳核规模, 稳核总语音时长)</code>。</li>
+<li><b>迭代重加权 M-估计</b>:以当前均值 m 为参照,赋 Tukey/biweight 权 <code>w_k = ψ(cos(emb_k, m))</code>(亲和高→权大,离群→权趋零),重算 <code>m = Σ w_k emb_k / Σ w_k</code>,迭代收敛 → 原型 <code>p_e</code>;</li>
+<li><b>稳核</b>:剔 <code>cos(emb_k, p_e) &lt; stability_threshold</code> 的离群;</li>
+<li><b>稳健度</b> <code>ρ_e = 稳核内子向量到 p_e 的平均亲和</code>;</li>
+<li><b>置信度</b> <code>c_e = g(ρ_e, 稳核规模, 稳核总语音)</code>;</li>
+<li>同时<b>估计同人变异协方差 Σ_within</b>:所有实体稳核内的条件散度平均(全局共享)。</li>
 </ol>
 
 <h3>3.2 不足 / 缺失的重提取(完全包含的说话人)</h3>
-<p>若 <code>稳核数 &lt; min_stable_count</code> 或 <code>稳核总语音 &lt; min_stable_speech_seconds</code> → 判为<b>不足</b>:</p>
+<p>若稳核不满足 <code>count ≥ min_stable_count</code> 且 <code>总语音 ≥ min_stable_speech_seconds</code> → 判不足:</p>
 <ol>
-<li>在该窗找 <b>"完全包含"</b>的独白段:该段只有 L、无重叠、段长 ≥ <code>reextract_min_solo_seconds</code>;</li>
-<li>对干净独白段<b>重切音频、重滑窗 embed</b>(可用更长 sub_window 提升信号),再跑一次 3.1 稳核过滤并入稳核。</li>
+<li>在该窗找 <b>"完全包含"</b>独白段(只 L、无重叠、段长 ≥ <code>reextract_min_solo_seconds</code>);</li>
+<li>对干净独白段重切音频、重滑窗 embed,再过 3.1 稳核过滤并入稳核。</li>
 </ol>
-<div class="note">仍不足 → <code>c_e</code> 极低,标记为<b>待分配实体</b>(不当种子,但可在 3.3 被分配)。极端无数据 → 留为独立 ID(待人工)。</div>
+<div class="note">仍不足 → <code>c_e</code> 极低,标记为<b>待分配</b>(不主导 3.4 优化,在 3.5/3.6 被求解)。</div>
 
-<h3>3.3 分层匹配 (Layered Matching)</h3>
-<p>每实体已有原型 <code>p_e</code> + 置信度 <code>c_e</code>。构建<b>亲和图</b> <code>G=(V,E)</code>,V=实体,边权 <code>a(e,f)=cos(p_e,p_f)</code>。按下面四层依次求解,得到每实体归属的全局说话人。</p>
+<h3>3.3 生成式匹配概率 (Generative Match Posterior)</h3>
+<p>把裸余弦升级为<b>校准后的同人后验</b>,建模为两个生成模型的似然比:</p>
+<pre>同说话人模型 H_same:  emb ~ N(p, Σ_within)       # 同人音色波动
+异说话人模型 H_diff:  emb ~ N(p, Σ_between)      # 不同人差异(全局散度估计)
 
-<div class="core">
-<b>① 种子锚定 (Seed Anchoring)</b> —— 确立候选全局说话人锚<br>
-按 <code>c_e</code> 降序遍历实体作为候选种子;候选种子 s 若与<b>已选种子</b>的最大亲和 <code>max a(s, ·) &lt; tau_spawn</code> → 列为新全局说话人锚(它是高置信的"新人");否则丢弃(已被某个已有种子代表)。结果:锚集 <code>A = {a_1..a_K}</code>。
-</div>
+似然比 LLR(e,f) = log p(p_e, p_f | H_same) − log p(p_e, p_f | H_diff)
+同人后验 P_same(e,f) = σ( LLR + log(π/(1−π)) )   # π = prior_same,σ=sigmoid</pre>
+<p>边权不再是"相似度",而是<b>在生成式模型下的同人后验概率</b> <code>q_ef = P_same(e,f)</code>。Σ_within/Σ_between 从数据自适应估计(也可外接预训练值)。</p>
 
-<div class="core">
-<b>② 互最近邻匹配 (Mutual-Nearest-Neighbor Matching)</b> —— 建高置信同说话人边<br>
-对非种子实体 e,找其亲和最大者 <code>nn(e)</code>;若 <code>a(e, nn(e)) ≥ tau_match</code> <b>且</b> <code>nn(nn(e)) == e</code>(互为最近) → 在 e 与 nn(e) 间建<b>同说话人边</b>。这些边是"两人互认"的强证据,几乎无误配。
-</div>
+<h3>3.4 最小违例对应分割 (Minimum-Disagreement Partition)</h3>
+<p>这是本方案的核心优化。建<b>带概率边的图</b> G=(V,E),V=实体,边权 <code>q_ef</code>(同人后验)。求分割 <code>Π</code>(每部分=一个全局说话人)使<b>期望违例代价最小</b>:</p>
+<pre>min_Π  Cost(Π) =
+   Σ_{(e,f) 被拆开}   q_ef        # 强同人却拆开 → 代价 q_ef
+  + Σ_{(e,f) 被合并}   (1 − q_ef)  # 强异人却合并 → 代价 1−q_ef
 
-<div class="core">
-<b>③ 残留分配 (Residual Assignment)</b> —— 把剩余实体挂到锚<br>
-未被②匹配的实体 e:分配给亲和最大、且 <code>a(e, a_k) ≥ tau_assign</code> 的种子锚 <code>a_k</code>;若对所有锚 <code>a &lt; tau_assign</code> → e 自成新说话人(并入锚集 A)。
-</div>
+即:最小化"判错"的期望次数。这是 correlation clustering(无预设说话人数 K)的标准目标。</pre>
+<p><b>求解</b>:</p>
+<ul>
+<li><code>solver=pivot</code>:Pivot 局部搜索(Ailon–Charikar–Newman),O(n²),3-近似保证,大实例用;</li>
+<li><code>solver=ilp</code>:整数线性规划精确解(branch-and-bound),实体数 ≤ ~50 时可用,得全局最优。</li>
+</ul>
+<div class="core">这步把"谁和谁同人"从"启发式分层匹配"升级为<b>一个有目标函数的优化问题</b>——直接最小化判错期望,无人工阈值(τ_spawn/match/assign 退化为生成式后验的自然产物)。</div>
 
-<div class="core">
-<b>④ 冲突最优求解 (Conflict Resolution)</b> —— 仲裁多对一/一对多<br>
-对"多实体争同一锚 / 一实体多候选"的冲突子图:以 <code>cost(e, a_k) = 1 − a(e, a_k)</code> 为代价建二分图(实体 × 锚),<b>Hungarian 求总代价最小的分配</b>。允许 many-to-one(多实体同属一锚=同人跨窗),但每实体归宿唯一。低置信实体在代价里被弱化(不主导仲裁)。
-</div>
+<h3>3.5 变分 E-M 精修 (Variational Refinement)</h3>
+<p>把 3.4 的硬分割当初始化,跑变分 E-M 进一步收敛边界:</p>
+<ul>
+<li><b>模型</b>:每个全局说话人 k 是一个潜变量高斯 <code>N(μ_k, Σ_within)</code>,实体 e 的归属 <code>z_e ∈ {1..K}</code> 为潜变量;</li>
+<li><b>E 步</b>:算 <code>r_{e,k} ∝ π_k · N(p_e | μ_k, Σ_within)</code>(实体属各说话人的后验责任);</li>
+<li><b>M 步</b>:<code>μ_k = Σ_e r_{e,k} p_e / Σ_e r_{e,k}</code>,更新 <code>π_k</code>;可选更新 <code>Σ_within</code>;</li>
+<li>迭代 <code>em_iterations</code> 轮;低置信实体用 r 软分配而非硬挂,边界更平滑。</li>
+</ul>
+<div class="note">这一步用生成式说话人模型"精修"3.4 的分割:把分割从一个组合优化解,变成在概率模型下的最大似然/变分推断,能纠正 3.4 个别误判。</div>
 
-<p>四层结束:每实体归属一个锚(或自成锚)→ 锚 = 全局说话人(S01, S02, …)→ 得 <code>(窗, local) → 全局 ID</code> 映射。</p>
+<h3>3.6 歧义最优传输仲裁 (Ambiguity Optimal-Transport Arbitration)</h3>
+<p>对仍歧义(r_{e,·} 多峰、max 责任低)的实体,在 3.5 收敛的说话人集上求<b>最优传输</b>:</p>
+<ul>
+<li>代价 <code>C(e,k) = 1 − r_{e,k}</code>,实体×说话人二分图;</li>
+<li>Hungarian / Sinkhorn 求总代价最小、且满足"每实体唯一归宿、说话人容量下限"的分配;</li>
+<li>实在无解(全部低责任)→ 该实体自成新说话人,回到 3.5 再迭代一轮。</li>
+</ul>
 
 <h2>4. 整体流程</h2>
 <pre>长音频
   │
  ├─ Step1 分段转写:切窗 → MOSS → 每窗 {offset, transcript(local [Sxx])}
  │
- ├─ Step2 滑窗提取:按 transcript 定位每实体语音区 → 滑窗 speaker encoder
+ ├─ Step2 滪窗提取:按 transcript 定位每实体语音区 → 滑窗 speaker encoder
  │     ↓ 每实体一组 sub-embeddings
  │
- └─ Step3 说话人匹配(算法集中):
-       ├─ 3.1 稳健原型:迭代重加权 medoid → p_e;剔离群稳核;ρ_e/c_e
-       ├─ 3.2 不足重提取:稳核不够 → "完全包含"独白段重 embed;还不足→待分配
-       └─ 3.3 分层匹配:
-            ① 种子锚定(c_e 降序,与已有锚 max<τ_spawn → 新锚)
-            ② 互最近邻匹配(互为最近且 a≥τ_match → 同说话人边)
-            ③ 残留分配(挂到 max a≥τ_assign 的锚,否则自成新锚)
-            ④ 冲突最优求解(Hungarian 最小代价二分分配)
-             ↓ (窗,local)→全局ID
+ └─ Step3 对应关系求解(算法集中):
+       3.1 稳健原型(Tukey M-估计 → p_e;稳核剔离群;ρ_e/c_e;估 Σ_within)
+       3.2 不足重提取("完全包含"独白段重 embed;还不足→待分配)
+       3.3 生成式匹配概率(LLR + sigmoid → 同人后验 q_ef;估 Σ_between)
+       3.4 最小违例分割(min Σ 拆开·q + 合并·(1−q);pivot 或 ILP 求解)
+       3.5 变分 E-M(潜变量高斯,E/M 步迭代精修边界)
+       3.6 最优传输仲裁(Hungarian/Sinkhorn 解歧义实体)
+            ↓ (窗,local)→全局ID
        → 重写 merged.txt:全局时间戳 + 全局说话人</pre>
 
 <h2>5. 输出</h2>
 <ul>
-<li><code>merged.txt</code>:全局时间戳 + 全局说话人标签(S01/S02… 跨窗一致)</li>
+<li><code>merged.txt</code>:全局时间戳 + 全局说话人标签(跨窗一致)</li>
 <li><code>prototypes.json</code>:每实体原型 p_e + 置信度 c_e + 稳健度 ρ_e</li>
-<li><code>affinity_graph.json</code>:实体间亲和矩阵 + 匹配边(调试 ①②③④)</li>
-<li><code>speaker_mapping.json</code>:(窗,local)→全局 ID + 置信度 + 归属锚</li>
+<li><code>posterior_graph.json</code>:同人后验矩阵 q_ef(调试 3.3/3.4)</li>
+<li><code>partition.json</code>:3.4 分割 + 3.5 责任 r_{e,k}(调试收敛)</li>
+<li><code>speaker_mapping.json</code>:(窗,local)→全局 ID + 置信度 + 归属</li>
 </ul>
 
-<h2>6. 与旧方案(重叠 1:1)的差异</h2>
+<h2>6. 与上一版(分层启发式匹配)的差异</h2>
 <table>
-<tr><th>维度</th><th>旧方案(scheme.html)</th><th>本方案</th></tr>
-<tr><td>对应依据</td><td>重叠区同时间 1:1 对应</td><td>亲和图 + 分层匹配(互最近邻→残留→冲突)</td></tr>
-<tr><td>是否用重叠区</td><td>必须重叠且两窗都转写</td><td><b>不用</b>(暂不考虑重叠 1:1)</td></tr>
-<tr><td>稳健性</td><td>靠重叠同时间证据</td><td>靠迭代重加权 medoid + 稳核剔离群</td></tr>
-<tr><td>不足处理</td><td>短段降权</td><td>"完全包含"独白段重提取</td></tr>
-<tr><td>冲突</td><td>取最高余弦</td><td>Hungarian 二分最优分配</td></tr>
-<tr><td>结构</td><td>逻辑分散</td><td>算法集中 step3,step1/2 只汇总</td></tr>
+<tr><th>维度</th><th>上一版</th><th>本版</th></tr>
+<tr><td>边权</td><td>裸余弦</td><td>生成式同人后验(LLR+sigmoid)</td></tr>
+<tr><td>分组</td><td>种子锚定→互最近邻→残留(启发式)</td><td>最小违例分割(correlation clustering,有目标函数的优化)</td></tr>
+<tr><td>阈值</td><td>τ_spawn/match/assign 三个手调门</td><td>无手调门;后验自然产生(只剩先验 π)</td></tr>
+<tr><td>精修</td><td>无</td><td>变分 E-M(潜变量高斯)精修边界</td></tr>
+<tr><td>歧义</td><td>Hungarian 局部</td><td>最优传输全局仲裁</td></tr>
+<tr><td>同人变异</td><td>未建模</td><td>Σ_within/Σ_between 自适应估计</td></tr>
 </table>
 
 <h2>7. 边界与限制</h2>
 <ul>
-<li>三个门 <code>tau_spawn / tau_match / tau_assign</code> 需按你的 encoder + 域校准(不同 encoder 亲和尺度不同);</li>
-<li>同一人跨窗音色漂移(疲劳/换麦)可能被互最近邻②漏掉 → 走③残留分配兜底,仍挂到最相近的锚;</li>
-<li>MOSS 转写把两人合一/一人拆二 → 该实体原型被污染;3.1 稳核过滤能挡一部分,极端的会成低置信待分配;</li>
-<li>本版不用重叠 1:1,实现简单;若后续互最近邻②命中率不够,可再叠加重叠同时间约束作 ②' 的强证据边。</li>
+<li><code>Σ_within / Σ_between</code> 的估计质量决定 3.3 后验准不准;数据少时退化为裸余弦,建议外接预训练协方差或在校准集上拟合;</li>
+<li>3.4 的 pivot 是 3-近似,极端边界例可能次优;实体数少时用 <code>ilp</code> 取精确解;</li>
+<li>3.5 E-M 对初始化(3.4 的解)敏感;3.4 给的好初值是 E-M 收敛的前提;</li>
+<li>同一人跨窗音色漂移大 → 3.3 后验偏低 → 可能被 3.4 拆成两人;3.5 的软分配能部分缓解,极端需放宽 Σ_within;</li>
+<li>MOSS 转写错把两人合一 → 该实体原型被污染;3.1 稳核能挡一部分,残留由 3.3 低后验自然隔离。</li>
 </ul>
 
 </body>
