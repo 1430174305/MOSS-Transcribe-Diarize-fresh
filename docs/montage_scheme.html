@@ -49,6 +49,7 @@
 
 <h2><span class="step">1</span> Step1 分段转写</h2>
 <p>长音频切 ≤90min 窗,每窗跑 MOSS → <code>{offset, transcript(local [Sxx])}</code>。本步只产出信息,不做匹配。</p>
+<div class="note"><b>窗口不需要重叠。</b>montage 投票是<b>按音色</b>跨窗匹配(把两窗说话人片段塞进同一 montage 让 MOSS 判同),不靠"两窗同时间同说话人"的同时间证据。所以窗可以<b>背靠背、VAD 切静音、无重叠</b>——切窗更简单、不重复转写、文本合并退化为直接拼接(每窗拥有 <code>[offset, end]</code>,相邻首尾相接)。<b>重叠只是旧版(同时间 1:1)才需要,本版去掉。</b><br>唯一边际好处:重叠区让跨边界的说话人在两窗都多一点语音 → <code>f_ij</code> 稍稳,但非必需;想要这点边际可留小重叠(如 30s),否则直接无重叠最省。</div>
 
 <h2><span class="step">2</span> Step2 片段池 + 随机 montage</h2>
 
